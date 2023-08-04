@@ -1,3 +1,37 @@
+# About
+
+This shows how to create a small Linux VM with a Zig program running
+as init.
+
+Presently init doesn't do anything except mount `/sys`. The output
+looks something like this.
+
+```sh
+[    0.358247] Run /init as init process
+info: Zig is running as init!
+info: uname: Linux localhost 6.1.42 #5 SMP PREEMPT_DYNAMIC Thu Aug  3 11:36:24 BST 2023 x86_64 (none)
+info: ls .
+info:   dir: sys
+info:  file: init
+info:   dir: bin
+info:   dir: root
+info:   dir: dev
+info: ls dev
+info:   dev: console
+info: ls sys
+info:   dir: kernel
+info:   dir: power
+info:   dir: class
+info:   dir: devices
+info:   dir: dev
+info:   dir: hypervisor
+info:   dir: fs
+info:   dir: bus
+info:   dir: firmware
+info:   dir: block
+info:   dir: module
+```
+
 # Build
 
 This covers building a complete Linux VM with our Zig userland. We
