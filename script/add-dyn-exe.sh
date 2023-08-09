@@ -1,6 +1,7 @@
 #!/bin/sh -eu
 
 help="$0 [-i] <initrd-root> <exe>"
+is_init=
 
 while getopts ':ih' opt; do
         case $opt in
@@ -27,6 +28,8 @@ if [ $# -lt 2 ]; then
         exit 1
 fi
 
+copy='install --compare --verbose -D --no-target-directory'
+
 rootdir=$(realpath $1)
 path_or_name=$2
 path=
@@ -45,17 +48,17 @@ fi
 libs=$(ldd $path | awk 'NF > 3 { print $3 }')
 
 mkdir -p $rootdir$(dirname $path)
-rsync --progress $path $rootdir$path
-ln -fvs $rootdir$path $rootdir/bin/$(basename $path)
+$copy $path $rootdir$path
+ln -fvs $path $rootdir/bin/$(basename $path)
 
 interp=$(readelf -p .interp $path | grep -o '/.*')
-rsync --progress $interp $rootdir$interp
+$copy $interp $rootdir$interp
 
 if [ $is_init ]; then
-        ln -fvs $rootdir$path $rootdir/init
+        ln -fvs $path $rootdir/init
 fi
 
 for lib in $libs; do
         mkdir -p $rootdir$(dirname $lib)
-        rsync --progress $lib $rootdir/$lib
+        $copy $lib $rootdir/$lib
 done
