@@ -54,6 +54,9 @@
 
             lldb_16
             gdb
+
+            nsjail
+            busybox
           ];
         };
       };
