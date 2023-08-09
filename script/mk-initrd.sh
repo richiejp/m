@@ -15,5 +15,5 @@ fi
 bname=$(basename $rootdir)
 pdir=$(pwd)
 cd $rootdir
-find . | cpio -v -H newc -o | gzip -n > ../$bname.cpio.gz
+find . | cpio -R 0:0 -v -H newc -o | gzip -n > ../$bname.cpio.gz
 cd $pdir
