@@ -1,6 +1,5 @@
 const std = @import("std");
 const log = std.log;
-const info = std.log.info;
 const fs = std.fs;
 const os = std.os;
 const errno = os.errno;
@@ -44,7 +43,7 @@ fn ls(path: []const u8) !void {
     defer idir.close();
     var itr = idir.iterate();
 
-    info("ls {s}", .{path});
+    log.info("ls {s}", .{path});
 
     while (try itr.next()) |entry| {
         const t = switch (entry.kind) {
@@ -54,7 +53,7 @@ fn ls(path: []const u8) !void {
             else => "other",
         };
 
-        info("{s:5}: {s}", .{ t, entry.name });
+        log.info("{s:5}: {s}", .{ t, entry.name });
     }
 }
 
@@ -82,17 +81,17 @@ fn mvRec(src: fs.Dir, dst: fs.Dir, root_dev: linux.dev_t) !void {
                 try fstatat(src, &try os.toPosixPath(base.name), &src_stat);
 
                 if (src_stat.dev != root_dev) {
-                    info("skip file {s}", .{base.name});
+                    log.debug("skip file {s}", .{base.name});
                     continue;
                 }
 
-                info("mv file {s}", .{base.name});
+                log.debug("mv file {s}", .{base.name});
 
                 try src.copyFile(base.name, dst, base.name, .{});
                 try src.deleteFile(base.name);
             },
             .sym_link => {
-                info("ln {s}", .{base.name});
+                log.debug("ln {s}", .{base.name});
                 var buf: [linux.PATH_MAX]u8 = undefined;
 
                 const link = try src.readLink(base.name, &buf);
@@ -104,10 +103,10 @@ fn mvRec(src: fs.Dir, dst: fs.Dir, root_dev: linux.dev_t) !void {
                 defer sub_src.close();
                 const sub_src_stat = try os.fstat(sub_src.fd);
 
-                info("stat dir {s}: {}", .{ base.name, sub_src_stat });
+                log.debug("stat dir {s}: {}", .{ base.name, sub_src_stat });
 
                 if (sub_src_stat.ino == dst_stat.ino) {
-                    info("skip dir {s}", .{base.name});
+                    log.debug("skip dir {s}", .{base.name});
                     continue;
                 }
 
@@ -115,24 +114,24 @@ fn mvRec(src: fs.Dir, dst: fs.Dir, root_dev: linux.dev_t) !void {
                 defer sub_dst.close();
 
                 if (root_dev != sub_src_stat.dev) {
-                    info("shallow mv {s}", .{base.name});
+                    log.debug("shallow mv {s}", .{base.name});
                     continue;
                 }
 
-                info("mv dir {s}", .{base.name});
+                log.debug("mv dir {s}", .{base.name});
                 try mvRec(sub_src, sub_dst, root_dev);
 
                 src.deleteDir(base.name) catch |err| {
                     switch (err) {
                         error.DirNotEmpty => {
-                            info("left {s}", .{base.name});
+                            log.debug("left {s}", .{base.name});
                         },
                         else => return err,
                     }
                 };
             },
             else => {
-                info("skip {} {s}", .{ base.kind, base.name });
+                log.debug("skip {} {s}", .{ base.kind, base.name });
             },
         }
     }
@@ -160,28 +159,28 @@ fn switch_root() !void {
         defer new_root.close();
         const data: [*:0]const u8 = "size=100240k";
         try mount("none", "/newroot", "tmpfs", 0, @intFromPtr(data));
-        info("Temporarily mounted new root at /newroot", .{});
+        log.info("Temporarily mounted new root at /newroot", .{});
     }
 
     var new_root = try old_root.openDir("newroot", .{});
     defer new_root.close();
     try mvRec(old_root, new_root, root_dev);
-    info("Moved root contents to /newroot", .{});
+    log.info("Moved root contents to /newroot", .{});
 
     try std.os.chdir("/newroot");
     try mount(".", "/", ":-)", MS_MOVE, 0);
-    info("Moved /newroot to /", .{});
+    log.info("Moved /newroot to /", .{});
 
     try chroot(".");
     try std.os.chdir("/");
-    info("chrooted into new /", .{});
+    log.info("chrooted into new /", .{});
 }
 
 fn init() !void {
-    info("Switching root away from rootfs because of pivot_root", .{});
+    log.info("Switching root away from rootfs because of pivot_root", .{});
     try switch_root();
 
-    info("Mounting /proc and /sys, we'll get proper error traces now", .{});
+    log.info("Mounting /proc and /sys, we'll get proper error traces now", .{});
     try mount("none", "/proc", "proc", 0, 0);
     try mount("none", "/sys", "sysfs", 0, 0);
 
@@ -208,12 +207,12 @@ pub fn main() !void {
     const is_init = std.os.linux.getpid() == 1;
 
     if (is_init) {
-        info("Zig is running as init!", .{});
+        log.info("Zig is running as init!", .{});
     } else {
-        info("Zig is not running as init.", .{});
+        log.info("Zig is not running as init.", .{});
     }
 
-    info("uname: {s} {s} {s} {s} {s} {s}", std.os.uname());
+    log.info("uname: {s} {s} {s} {s} {s} {s}", std.os.uname());
 
     if (is_init) {
         try init();
