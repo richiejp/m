@@ -1,11 +1,11 @@
 # About
 
 This shows how to create a small Linux VM with a Zig program running
-as init.
+as init. I'm using it to test the kernel.
 
-Presently the init performs a `switch_root` and mounts `/proc` and
-`/sys`. Then it hands off to Busybox to run some more setup and start
-a shell.
+Presently the init performs a `switch_root` onto a `tmpfs` root and
+mounts `/proc` and `/sys`. Then it hands off to Busybox to run some
+more setup and start a shell.
 
 Below is what the output looks like with `-Doptimize=ReleaseSafe`.
 
@@ -23,6 +23,13 @@ info: Mounting /proc and /sys, we'll get proper error traces now
 /bin/sh: can't access tty; job control turned off
 ~ #
 ```
+
+The kernel creates an initial file system called rootfs and populates
+it with the contents of the initrd image. This is basically a tmpfs
+file system and would be fine for testing except that it does not
+support `pivot_root`. So we make a new root fs.
+
+Related article: [Minimal Linux VM cross compiled with Clang and Zig](zig-cross-compile-ltp-ltx-linux)
 
 # Build
 
@@ -133,3 +140,7 @@ and whatever else.
 I also want to reduce the amount of shell script to minimum. `zig
 build <subcmd>` should replace the scripts on the host and init will
 replace `/etc/init.d/rcS`.
+
+# Acknowledgments
+
+- Thanks jacobly helping me with why debug symbols were missing.
