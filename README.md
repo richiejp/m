@@ -3,33 +3,25 @@
 This shows how to create a small Linux VM with a Zig program running
 as init.
 
-Presently init doesn't do anything except mount `/sys`. The output
-looks something like this.
+Presently the init performs a `switch_root` and mounts `/proc` and
+`/sys`. Then it hands off to Busybox to run some more setup and start
+a shell.
+
+Below is what the output looks like with `-Doptimize=ReleaseSafe`.
 
 ```sh
-[    0.358247] Run /init as init process
+...
+[    0.361427] Run /init as init process
 info: Zig is running as init!
 info: uname: Linux localhost 6.1.42 #5 SMP PREEMPT_DYNAMIC Thu Aug  3 11:36:24 BST 2023 x86_64 (none)
-info: ls .
-info:   dir: sys
-info:  file: init
-info:   dir: bin
-info:   dir: root
-info:   dir: dev
-info: ls dev
-info:   dev: console
-info: ls sys
-info:   dir: kernel
-info:   dir: power
-info:   dir: class
-info:   dir: devices
-info:   dir: dev
-info:   dir: hypervisor
-info:   dir: fs
-info:   dir: bus
-info:   dir: firmware
-info:   dir: block
-info:   dir: module
+info: Switching root away from rootfs because of pivot_root
+info: Temporarily mounted new root at /newroot
+info: Moved root contents to /newroot
+info: Moved /newroot to /
+info: chrooted into new /
+info: Mounting /proc and /sys, we'll get proper error traces now
+/bin/sh: can't access tty; job control turned off
+~ #
 ```
 
 # Build
@@ -37,6 +29,9 @@ info:   dir: module
 This covers building a complete Linux VM with our Zig userland. We
 build two images, a kernel and initrd, which can be "direct booted" by
 QEMU.
+
+For now it doesn't cover building Busybox. I haven't figured out how
+to do that with Zig yet.
 
 ## Nix note
 
@@ -46,10 +41,10 @@ If you are using Nix and have flakes enabled then you can do:
 $ nix develop
 ```
 
-This will provide an unstable Zig (with ZLS) and bunch of stuff for
-kernel development. However note that Nix's `lld.ld` wrapper script
-has an issue with kernel compilation. There is a workaround listed
-below.
+This will provide an unstable Zig (with ZLS), Busybox and bunch of
+stuff for kernel development. However note that Nix's `lld.ld` wrapper
+script has an issue with kernel compilation. There is a workaround
+listed below.
 
 ## Init
 
@@ -86,14 +81,22 @@ $ cp arch/arm64/boot/Image.gz $m_git_checkout/kernels/arm64/Image.gz
 
 ## Initrd
 
-Create the directory tree, for example:
+Create the directory tree and copy in our init, for example:
 
 ```sh
 $ mkdir -p initrds/x86_64/bin
 $ cp zig-out/bin/m initrds/x86_64/init
 ```
 
-You may need to include kernel modules in your initrd:
+If you have Busybox on your host system then you can copy it in with
+the following:
+
+```sh
+$ script/add-dyn-exe.sh -i initrds/x86_64 busybox
+$ script/link-busybox.sh initrds/x86_64 busybox
+```
+
+You *may* need to include kernel modules in your initrd:
 
 ```sh
 $ cd $linux_git_checout
@@ -120,3 +123,13 @@ If you cross compiled arm64 then its
 ```sh
 $ script/run-qemu.sh arm64 initrds/arm64.cpio.gz kernels/arm64/Image.gz
 ```
+
+# TODO
+
+A big motivator for doing this is to leverage Zig's cross compilation
+abilities and build system. So obviously I want Zig to compile Busybox
+and whatever else.
+
+I also want to reduce the amount of shell script to minimum. `zig
+build <subcmd>` should replace the scripts on the host and init will
+replace `/etc/init.d/rcS`.
