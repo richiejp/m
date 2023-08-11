@@ -56,7 +56,7 @@
             gdb
 
             nsjail
-            busybox
+            (busybox.override { enableAppletSymlinks = false; })
           ];
         };
       };
