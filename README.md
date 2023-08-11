@@ -99,7 +99,7 @@ If you have Busybox on your host system then you can copy it in with
 the following:
 
 ```sh
-$ script/add-dyn-exe.sh -i initrds/x86_64 busybox
+$ script/add-dyn-exe.sh initrds/x86_64 busybox
 $ script/link-busybox.sh initrds/x86_64 busybox
 ```
 
