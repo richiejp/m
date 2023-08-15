@@ -4,16 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
+    const init = b.addExecutable(.{
         .name = "m",
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
 
-    b.installArtifact(exe);
+    b.installArtifact(init);
 
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(init);
 
     run_cmd.step.dependOn(b.getInstallStep());
 
@@ -23,6 +23,15 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    const xplt = b.addExecutable(.{
+        .name = "xplt",
+        .root_source_file = .{ .path = "src/xplt.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    b.installArtifact(xplt);
 
     const unit_tests = b.addTest(.{
         .root_source_file = .{ .path = "src/main.zig" },
