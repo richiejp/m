@@ -131,6 +131,33 @@ If you cross compiled arm64 then its
 $ script/run-qemu.sh arm64 initrds/arm64.cpio.gz kernels/arm64/Image.gz
 ```
 
+# Debug
+
+## Kernel
+
+If your kernel has debug symbols then you can connect with gdb to
+QEMU. First start QEMU with `-s` and, if you have KASLR enabled, get
+the kernel base address.
+
+```sh
+$ script/run-qemu.sh kvm initrds/x86_64.cpio.gz kernels/x86_64/bzImage -s
+# head -n 3 /proc/kallsyms
+ffffffffb0000000 T startup_64
+ffffffffb0000000 T _stext
+ffffffffb0000000 T _text
+```
+
+So `$text_address=0xffffffffb0000000`, then start gdb.
+
+```sh
+$ gdb
+gdb> add-symbol-file $linux_git_checkout/vmlinux $text_address
+gdb> target remote localhost:1234
+```
+
+To debug kernel boot add `-S` to the `run-qemu.sh` script and disable
+KASLR.
+
 # TODO
 
 A big motivator for doing this is to leverage Zig's cross compilation
