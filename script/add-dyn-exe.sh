@@ -58,7 +58,19 @@ if [ $is_init ]; then
         ln -fvs $path $rootdir/init
 fi
 
-for lib in $libs; do
+copy_lib() {
+        local lib=$1
+
         mkdir -p $rootdir$(dirname $lib)
         $copy $lib $rootdir/$lib
+
+        for inner in $(ldd $lib | awk 'NF > 3 { print $3 }'); do
+                echo Inner dependency $inner
+                copy_lib $inner
+        done
+}
+
+for lib in $libs; do
+        echo Immediate dependency $lib
+        copy_lib $lib
 done
