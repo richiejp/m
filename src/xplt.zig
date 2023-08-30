@@ -71,14 +71,14 @@ const TLSContext = extern struct {
 
 // Zig std library doesn't consider possiblity of setting iov_base to null
 const iovec_const = extern struct {
-    iov_base: ?[*]const u8,
+    iov_base: [*c]const u8,
     iov_len: usize,
 };
 
 pub fn writev(fd: os.fd_t, iov: []const iovec_const) os.WriteError!usize {
     const iov_count = @as(u31, @intCast(iov.len));
     while (true) {
-        const rc = l.syscall3(.writev, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(&iov), iov_count);
+        const rc = l.syscall3(.writev, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(iov.ptr), iov_count);
         switch (errno(rc)) {
             .SUCCESS => return @as(usize, @intCast(rc)),
             .INTR => continue,
