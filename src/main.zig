@@ -157,7 +157,7 @@ fn switch_root() !void {
     {
         var new_root = try mkpath(old_root, "newroot", 0o700);
         defer new_root.close();
-        const data: [*:0]const u8 = "size=100240k";
+        const data: [*:0]const u8 = "size=50%";
         try mount("none", "/newroot", "tmpfs", 0, @intFromPtr(data));
         log.info("Temporarily mounted new root at /newroot", .{});
     }
