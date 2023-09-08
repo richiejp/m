@@ -10,6 +10,8 @@ const E = l.E;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+const MIN_READ_BUFFER = 8192;
+
 const Opcode = enum(u32) {
     FUSE_LOOKUP = 1,
     FUSE_FORGET = 2,
@@ -91,16 +93,24 @@ const InitIn = extern struct {
     minor: u32,
     max_readahead: u32,
     flags: u32,
+    flags2: u32,
+    unused: [11]u32,
 };
 
 const InitOut = extern struct {
-    common: InitIn,
+    major: u32,
+    minor: u32,
+    max_readahead: u32,
+    flags: u32,
 
     max_background: u16,
     congestion_threshold: u16,
     max_write: u32,
     time_gran: u32,
-    unused: [9]u32 = .{0} ** 9,
+    max_pages: u16,
+    map_alignment: u16,
+    flags2: u32,
+    unused: [7]u32 = .{0} ** 7,
 };
 
 const InitOutMsg = extern struct {
@@ -117,11 +127,26 @@ const MNT = struct {
 const S = @This();
 
 dev: fs.File,
+path_buf: [os.PATH_MAX]u8 = .{0} ** os.PATH_MAX,
+path: [*:0]const u8 = "",
+read_buf: [MIN_READ_BUFFER]u8 = undefined,
+write_buf: [MIN_READ_BUFFER]u8 = undefined,
 
-pub fn init(path: [*:0]const u8) !S {
+fn umount(self: S) void {
+    const ret = os.errno(l.umount(self.path));
+
+    if (ret != .SUCCESS)
+        log.err("fuse: umount {s}: {}", .{ self.path, ret });
+}
+
+pub fn init(path: []const u8) !S {
     var self = S{
         .dev = try fs.openFileAbsolute("/dev/fuse", .{ .mode = .read_write }),
     };
+
+    @memcpy(self.path_buf[0 .. self.path_buf.len - 1][0..path.len], path);
+    self.path = @ptrCast(&self.path_buf);
+
     const fd = self.dev.handle;
 
     {
@@ -130,60 +155,64 @@ pub fn init(path: [*:0]const u8) !S {
         var buf: [64]u8 = .{0} ** 64;
         const opts = try std.fmt.bufPrintZ(&buf, "fd={},rootmode=40000,user_id={},group_id={}", .{ self.dev.handle, uid, gid });
 
-        const ret = l.mount("fuse", path, "fuse.fuse", MNT.NODEV | MNT.NOSUID, @intFromPtr(opts.ptr));
+        const ret = l.mount("fuse", self.path, "fuse.fuse", MNT.NODEV | MNT.NOSUID, @intFromPtr(opts.ptr));
         const err = os.errno(ret);
 
         if (err != .SUCCESS) {
-            log.err("fuse: mount: {}", .{err});
+            log.err("fuse: mount {s}: {}", .{ self.path, err });
             unreachable;
         }
+
+        errdefer self.umount();
     }
 
     {
-        var buf: [@sizeOf(InHeader) + @sizeOf(InitIn)]u8 = undefined;
+        const buf: []u8 = &self.read_buf;
+        const len = try os.read(fd, buf);
 
-        if (try os.read(fd, &buf) != buf.len)
-            unreachable;
+        if (len < @sizeOf(InHeader) + @sizeOf(InitIn)) unreachable;
 
-        const hdr: *InHeader = @ptrCast(@alignCast(buf[0..@sizeOf(InHeader)]));
+        const hdr = mem.bytesAsValue(InHeader, buf[0..@sizeOf(InHeader)]);
 
-        log.info("kernel: hdr: {}", .{hdr.*});
+        std.debug.print("kernel: hdr: {}\n", .{hdr.*});
 
         const opcode: Opcode = @enumFromInt(hdr.opcode);
-        if (opcode != .FUSE_INIT)
-            unreachable;
+        if (opcode != .FUSE_INIT) unreachable;
+        if (hdr.len != @sizeOf(InHeader) + @sizeOf(InitIn)) unreachable;
 
-        if (hdr.len != @sizeOf(InitIn))
-            unreachable;
+        const req = mem.bytesAsValue(InitIn, (buf[@sizeOf(InHeader)..][0..@sizeOf(InitIn)]));
 
-        const req: *InitIn = @ptrCast(@alignCast(buf[0..@sizeOf(InitIn)]));
+        std.debug.print("kernel: init: {}\n", .{req.*});
 
-        log.info("kernel: init: {}", .{req.*});
-
-        if (req.major != 7)
-            unreachable;
-
-        if (req.minor != 37)
-            unreachable;
+        if (req.major != 7) unreachable;
+        if (req.minor < 37) unreachable;
 
         const res = InitOutMsg{
             .head = .{
-                .len = @sizeOf(InitOut),
+                .len = @sizeOf(InitOutMsg),
                 .err = 0,
                 .unique = hdr.unique,
             },
             .body = .{
-                .common = req.*,
+                .major = 7,
+                .minor = 37,
+                .max_readahead = req.max_readahead,
+                .flags = req.flags,
+                .flags2 = req.flags2,
 
                 .max_background = 0,
                 .congestion_threshold = 0,
                 .max_write = 4096,
                 .time_gran = 0,
+                .max_pages = 1,
+                .map_alignment = 1,
             },
         };
 
-        if (try os.write(fd, mem.asBytes(&res)) != @sizeOf(@TypeOf(res)))
-            unreachable;
+        std.debug.print("fuse: init: {}\n", .{res});
+        if (try os.write(fd, mem.asBytes(&res)) != @sizeOf(@TypeOf(res))) unreachable;
+
+        mem.copyForwards(u8, buf, buf[@sizeOf(InHeader) + @sizeOf(InitIn) ..]);
     }
 
     return self;
@@ -191,6 +220,7 @@ pub fn init(path: [*:0]const u8) !S {
 
 pub fn deinit(self: S) void {
     self.dev.close();
+    self.umount();
 }
 
 test "init" {
@@ -205,8 +235,8 @@ test "init" {
             return err;
     };
 
-    var buf = [_]u8{0} ** fs.MAX_PATH_BYTES;
-    const mnt_path: [*:0]u8 = @ptrCast(try tmp_dir.realpath("fuse-test", buf[0 .. buf.len - 1]));
+    var buf = [_]u8{0} ** os.PATH_MAX;
+    const mnt_path = try tmp_dir.realpath("fuse-test", &buf);
     var mnt = try init(mnt_path);
     defer mnt.deinit();
 }
