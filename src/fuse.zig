@@ -118,6 +118,13 @@ const InitOutMsg = extern struct {
     body: InitOut,
 };
 
+const SetxattrIn = extern struct {
+    size: u32,
+    flags: u32,
+    setxattr_flags: u32,
+    padding: u32 = 0,
+};
+
 const MNT = struct {
     const NOSUID = 0x01;
     const NODEV = 0x02;
@@ -129,7 +136,9 @@ const S = @This();
 dev: fs.File,
 path_buf: [os.PATH_MAX]u8 = .{0} ** os.PATH_MAX,
 path: [*:0]const u8 = "",
-read_buf: [MIN_READ_BUFFER]u8 = undefined,
+
+read_len: usize = 0,
+read_buf: [MIN_READ_BUFFER * 2]u8 = undefined,
 write_buf: [MIN_READ_BUFFER]u8 = undefined,
 
 fn umount(self: S) void {
@@ -167,7 +176,7 @@ pub fn init(path: []const u8) !S {
     }
 
     {
-        const buf: []u8 = &self.read_buf;
+        var buf: []u8 = &self.read_buf;
         const len = try os.read(fd, buf);
 
         if (len < @sizeOf(InHeader) + @sizeOf(InitIn)) unreachable;
@@ -179,6 +188,8 @@ pub fn init(path: []const u8) !S {
         const opcode: Opcode = @enumFromInt(hdr.opcode);
         if (opcode != .FUSE_INIT) unreachable;
         if (hdr.len != @sizeOf(InHeader) + @sizeOf(InitIn)) unreachable;
+
+        self.read_len = len - hdr.len;
 
         const req = mem.bytesAsValue(InitIn, (buf[@sizeOf(InHeader)..][0..@sizeOf(InitIn)]));
 
@@ -223,20 +234,109 @@ pub fn deinit(self: S) void {
     self.umount();
 }
 
-test "init" {
-    const allc = std.testing.allocator;
-    var env = try std.process.getEnvMap(allc);
-    defer env.deinit();
-    const tmp_dir_path = env.get("TMPDIR") orelse "/tmp";
+pub fn do_one(self: *S) !void {
+    const buf: []u8 = &self.read_buf;
+    const fd = self.dev.handle;
 
-    var tmp_dir = try fs.openDirAbsolute(tmp_dir_path, .{});
-    tmp_dir.makeDir("fuse-test") catch |err| {
-        if (err != error.PathAlreadyExists)
-            return err;
+    while (self.read_len < @sizeOf(InHeader)) {
+        self.read_len += if (self.read_len < @sizeOf(InHeader))
+            try os.read(fd, buf[self.read_len..])
+        else
+            0;
+    }
+
+    const hdr = mem.bytesAsValue(InHeader, buf[0..@sizeOf(InHeader)]);
+
+    std.debug.print("kernel: hdr:  {}\n", .{hdr});
+    const opcode: Opcode = @enumFromInt(hdr.opcode);
+
+    std.debug.print("kernel: opcode: {}\n", .{opcode});
+
+    if (hdr.len > MIN_READ_BUFFER)
+        unreachable;
+
+    while (hdr.len > self.read_len)
+        self.read_len += try os.read(fd, buf[self.read_len..]);
+
+    var res = mem.bytesAsValue(OutHeader, self.write_buf[0..@sizeOf(OutHeader)]);
+    var res_written: usize = 0;
+
+    res.len = @sizeOf(OutHeader);
+    res.err = @intFromEnum(E.NOSYS);
+    res.unique = hdr.unique;
+
+    while (res_written < res.len)
+        res_written += try os.write(fd, self.write_buf[res_written..res.len]);
+
+    mem.copyForwards(u8, buf, buf[hdr.len..]);
+    self.read_len -= hdr.len;
+}
+
+pub fn loop(self: *S) !void {
+    while (true) {
+        self.do_one();
+    }
+}
+
+const TestEnv = struct {
+    mnt_path: []const u8,
+
+    pub fn init() !TestEnv {
+        const allc = std.testing.allocator;
+        var env = try std.process.getEnvMap(allc);
+        defer env.deinit();
+        const tmp_dir_path = env.get("TMPDIR") orelse "/tmp";
+
+        var tmp_dir = try fs.openDirAbsolute(tmp_dir_path, .{});
+        tmp_dir.makeDir("fuse-test") catch |err| {
+            if (err != error.PathAlreadyExists)
+                return err;
+        };
+
+        var buf = try allc.alloc(u8, os.PATH_MAX);
+
+        return .{
+            .mnt_path = try tmp_dir.realpath("fuse-test", buf),
+        };
+    }
+};
+
+test "init" {
+    const env = try TestEnv.init();
+
+    var mnt = try init(env.mnt_path);
+    defer mnt.deinit();
+}
+
+fn setxattr(path: [*:0]const u8, name: [*:0]const u8, value: []const u8, size: usize, flags: usize) usize {
+    return l.syscall5(.setxattr, @intFromPtr(path), @intFromPtr(name), @intFromPtr(value.ptr), size, flags);
+}
+
+fn setAttr(env: *const TestEnv) void {
+    var buf: [os.PATH_MAX]u8 = .{0} ** os.PATH_MAX;
+
+    const path = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/{s}", .{ env.mnt_path, "foo" }) catch |err| {
+        std.debug.print("bufPrint: {}", .{err});
+        return;
     };
 
-    var buf = [_]u8{0} ** os.PATH_MAX;
-    const mnt_path = try tmp_dir.realpath("fuse-test", &buf);
-    var mnt = try init(mnt_path);
+    const res = setxattr(@ptrCast(path), "user.bar", "baz", 3, 0);
+    const err = os.errno(res);
+
+    if (err != .SUCCESS) {
+        std.debug.print("setxattr: {s}: {}\n", .{ path, err });
+    }
+}
+
+test "one" {
+    const env = try TestEnv.init();
+
+    var mnt = try init(env.mnt_path);
     defer mnt.deinit();
+
+    std.debug.print("init: {s}\n", .{env.mnt_path});
+    var thread = try std.Thread.spawn(.{}, setAttr, .{&env});
+    defer thread.join();
+
+    try mnt.do_one();
 }
