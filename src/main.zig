@@ -197,7 +197,12 @@ fn rcS(allc: Allocator) !void {
 }
 
 fn sh(allc: Allocator) !void {
-    var child = std.process.Child.init(&[_][]const u8{"/bin/sh"}, allc);
+    var child = std.process.Child.init(&[_][]const u8{
+        "/bin/setsid",
+        "/bin/cttyhack",
+        "/bin/sh",
+        "-i",
+    }, allc);
 
     _ = try child.spawnAndWait();
 }
@@ -219,5 +224,13 @@ pub fn main() !void {
         try rcS(allc);
     }
 
-    try sh(allc);
+    const pid = try os.fork();
+
+    if (pid == 0) {
+        try sh(allc);
+        return;
+    }
+
+    while (true)
+        _ = os.waitpid(-1, 0);
 }
