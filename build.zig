@@ -33,6 +33,15 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(xplt);
 
+    const fuse_tests = b.addTest(.{
+        .name = "fuse-test",
+        .root_source_file = .{ .path = "src/fuse.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+
+    b.installArtifact(fuse_tests);
+
     const unit_tests = b.addTest(.{
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
