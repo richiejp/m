@@ -592,11 +592,7 @@ fn setXAttr(env: *const TestEnv) void {
     const res = setxattr(@ptrCast(path), XATTR_NAME, "baz", 3, 0);
     const err = os.errno(res);
 
-    if (err != .SUCCESS) {
-        std.debug.print("setxattr: {s}: {}\n", .{ path, err });
-    }
-
-    std.debug.print("setxattr: OK\n", .{});
+    std.debug.print("setxattr: {s}: {}\n", .{ path, err });
 }
 
 test "one" {
