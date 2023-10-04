@@ -17,14 +17,17 @@
     let
       sys = "x86_64-linux";
     in
-      with pkgs.legacyPackages.${sys};
+      with import pkgs { system = "${sys}"; config.allowUnfree = true; };
       {
         devShells.${sys}.default = mkShell {
           buildInputs = [
             zig.packages.${sys}.master
             zls.packages.${sys}.zls
 
+            automake
+            autoconf
             gnumake
+
             bear
             bc
             bison
@@ -47,13 +50,13 @@
             ncurses
             pkg-config
             cpio
+            fuse3
 
             llvmPackages_16.clang-unwrapped
             llvmPackages_16.bintools-unwrapped
             clang-tools_16
 
-            lldb_16
-            gdb
+            pwndbg
 
             nsjail
             (busybox.override { enableAppletSymlinks = false; })
