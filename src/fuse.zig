@@ -377,7 +377,7 @@ pub fn do_one(self: *S) !void {
                 .valid_nsec = 0,
                 .dummy = 0,
                 .attr = .{
-                    .ino = 1,
+                    .ino = hdr.nodeid,
                     .blocks = 1,
                     .size = 42,
                     .atime = time,
@@ -412,7 +412,7 @@ pub fn do_one(self: *S) !void {
                 .valid_nsec = 0,
                 .dummy = 0,
                 .attr = .{
-                    .ino = 1,
+                    .ino = hdr.nodeid,
                     .blocks = 1,
                     .size = 42,
                     .atime = time,
