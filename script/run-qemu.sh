@@ -31,7 +31,7 @@ case $arch in
                          -kernel $kernel \
                          -initrd $initrd \
                          -serial stdio \
-                         -fsdev local,security_model=mapped,id=fsdev-fs0,path=$(realpath .) \
+                         -fsdev local,readonly,security_model=mapped,id=fsdev-fs0,path=$(realpath .) \
                          -device virtio-9p-pci,fsdev=fsdev-fs0,mount_tag=fs0 \
                          -append 'console=ttyS0 earlyprintk=ttyS0 nokaslr panic=0' \
                          $@;;

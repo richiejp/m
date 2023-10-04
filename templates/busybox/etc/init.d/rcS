@@ -1,0 +1,30 @@
+#!/bin/sh -eux
+
+mount -t devtmpfs -o nosuid,size=1024k,mode=0755 devtmpfs /dev
+mkdir /dev/pts
+mount -t devpts devpts /dev/pts
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+
+mount -t cgroup2 none /sys/fs/cgroup
+mkdir -p /tmp /run /root
+chmod 700 /root
+mount -t tmpfs -o nosuid,nodev,size=10240k none /run
+mkdir -p /run/user/0
+mount -t tmpfs -o nosuid,nodev,size=25% none /tmp
+mkdir /dev/shm
+mount -t tmpfs -o nosuid,nodev,size=10% none /dev/shm
+mount -t debugfs none /sys/kernel/debug
+
+# Uncomment and change the path to m, see 9p in script/run-qemu.sh
+# mkdir -p /home/rich/m
+# mount -t 9p -o ro,trans=virtio fs0 /home/rich/m -oversion=9p2000.L,msize=512000
+
+ip link set lo up
+
+modprobe fuse
+
+export PATH=/bin
+
+stty intr ^[
+resize
