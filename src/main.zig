@@ -105,7 +105,7 @@ fn mvRec(src: fs.Dir, dst: fs.Dir, root_dev: linux.dev_t) !void {
 
                 log.debug("stat dir {s}: {}", .{ base.name, sub_src_stat });
 
-                if (sub_src_stat.ino == dst_stat.ino) {
+                if (sub_src_stat.dev == dst_stat.dev and sub_src_stat.ino == dst_stat.ino) {
                     log.debug("skip dir {s}", .{base.name});
                     continue;
                 }
