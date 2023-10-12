@@ -203,6 +203,21 @@ const SetxattrIn = extern struct {
     padding: u32 = 0,
 };
 
+const SetxattrInReq = struct {
+    hdr: SetxattrIn,
+    name: [:0]const u8,
+    value: []const u8,
+};
+
+const Request = struct { hdr: InHeader, body: union(enum) {
+    getattr: GetattrIn,
+    setattr: SetattrIn,
+    lookup: []const u8,
+    setxattr: SetxattrInReq,
+
+    other: Opcode,
+} };
+
 const OutUnion = extern union {
     init: InitOut,
     attr: AttrOut,
@@ -212,6 +227,26 @@ const OutUnion = extern union {
 const Response = extern struct {
     hdr: OutHeader,
     out: OutUnion,
+
+    pub fn init(req: Request) Response {
+        return Response{
+            .hdr = .{
+                .len = @sizeOf(OutHeader),
+                .unique = req.hdr.unique,
+                .err = 0,
+            },
+            .out = undefined,
+        };
+    }
+
+    pub fn send(self: Response, fd: os.fd_t) !void {
+        var to_write: []u8 align(1) = mem.asBytes(&self)[0..self.hdr.len];
+
+        while (to_write.len > 0) {
+            const written = try os.write(fd, to_write);
+            to_write = to_write[written..];
+        }
+    }
 };
 
 comptime {
@@ -224,30 +259,36 @@ const MNT = struct {
     const NOEXEC = 0x08;
 };
 
+pub const Ops = struct {
+    onSetxattr: ?fn (name: [:0]const u8, value: []const u8) void,
+};
+
 const S = @This();
 const XATTR_NAME: [:0]const u8 = "user.bar";
 
 dev: fs.File,
-path_buf: [os.PATH_MAX]u8 = .{0} ** os.PATH_MAX,
-path: [*:0]const u8 = "",
+path: [fs.MAX_PATH_BYTES - 1:0]u8,
 
 read_len: usize = 0,
 read_buf: [MIN_READ_BUFFER * 2]u8 = undefined,
 
 fn umount(self: S) void {
-    const ret = os.errno(l.umount(self.path));
+    const ret = os.errno(l.umount(&self.path));
 
     if (ret != .SUCCESS)
-        log.err("fuse: umount {s}: {}", .{ self.path, ret });
+        log.err("fuse: umount {s}: {}", .{ &self.path, ret });
 }
 
-pub fn init(path: []const u8) !S {
-    var self = S{
-        .dev = try fs.openFileAbsolute("/dev/fuse", .{ .mode = .read_write }),
-    };
+pub fn init(dir: fs.Dir) !S {
+    var self = blk: {
+        var real_path_buf: [fs.MAX_PATH_BYTES]u8 = undefined;
+        const path = try dir.realpath(".", &real_path_buf);
 
-    @memcpy(self.path_buf[0 .. self.path_buf.len - 1][0..path.len], path);
-    self.path = @ptrCast(&self.path_buf);
+        break :blk S{
+            .dev = try fs.openFileAbsolute("/dev/fuse", .{ .mode = .read_write }),
+            .path = try os.toPosixPath(path),
+        };
+    };
 
     const fd = self.dev.handle;
 
@@ -257,11 +298,11 @@ pub fn init(path: []const u8) !S {
         var buf: [64]u8 = .{0} ** 64;
         const opts = try std.fmt.bufPrintZ(&buf, "fd={},rootmode=40000,user_id={},group_id={}", .{ self.dev.handle, uid, gid });
 
-        const ret = l.mount("fuse", self.path, "fuse.fuse", MNT.NODEV | MNT.NOSUID, @intFromPtr(opts.ptr));
+        const ret = l.mount("fuse", &self.path, "fuse.fuse", MNT.NODEV | MNT.NOSUID, @intFromPtr(opts.ptr));
         const err = os.errno(ret);
 
         if (err != .SUCCESS) {
-            log.err("fuse: mount {s}: {}", .{ self.path, err });
+            log.err("fuse: mount {s}: {}", .{ &self.path, err });
             unreachable;
         }
 
@@ -276,7 +317,7 @@ pub fn init(path: []const u8) !S {
 
         const hdr = mem.bytesAsValue(InHeader, buf[0..@sizeOf(InHeader)]);
 
-        std.debug.print("kernel: hdr: {}\n", .{hdr.*});
+        log.info("kernel: hdr: {}", .{hdr.*});
 
         const opcode: Opcode = @enumFromInt(hdr.opcode);
         assert(opcode == .INIT);
@@ -286,7 +327,7 @@ pub fn init(path: []const u8) !S {
 
         const req = mem.bytesAsValue(InitIn, (buf[@sizeOf(InHeader)..][0..@sizeOf(InitIn)]));
 
-        std.debug.print("kernel: init: {}\n", .{req.*});
+        log.info("kernel: init: {}", .{req.*});
 
         assert(req.major == 7);
         assert(req.minor == 37);
@@ -313,7 +354,7 @@ pub fn init(path: []const u8) !S {
             },
         };
 
-        std.debug.print("fuse: init: {}\n", .{res});
+        log.info("fuse: init: {}", .{res});
         assert(try os.write(fd, mem.asBytes(&res)) == @sizeOf(@TypeOf(res)));
 
         mem.copyForwards(u8, buf, buf[@sizeOf(InHeader) + @sizeOf(InitIn) ..]);
@@ -327,7 +368,7 @@ pub fn deinit(self: S) void {
     self.umount();
 }
 
-pub fn do_one(self: *S) !void {
+pub fn start_read_req(self: *S) !Request {
     const buf: []u8 = &self.read_buf;
     const fd = self.dev.handle;
 
@@ -340,10 +381,10 @@ pub fn do_one(self: *S) !void {
 
     const hdr = mem.bytesAsValue(InHeader, buf[0..@sizeOf(InHeader)]);
 
-    std.debug.print("kernel: hdr:  {}\n", .{hdr});
+    log.info("kernel: hdr:  {}", .{hdr});
     const opcode: Opcode = @enumFromInt(hdr.opcode);
 
-    std.debug.print("kernel: opcode: {}\n", .{opcode});
+    log.info("kernel: opcode: {}", .{opcode});
 
     assert(hdr.len <= MIN_READ_BUFFER);
 
@@ -351,33 +392,87 @@ pub fn do_one(self: *S) !void {
         self.read_len += try os.read(fd, buf[self.read_len..]);
 
     const msg = buf[@sizeOf(InHeader)..hdr.len];
-
-    var res = Response{
-        .hdr = .{
-            .len = @sizeOf(OutHeader),
-            .unique = hdr.unique,
-            .err = 0,
-        },
-        .out = undefined,
-    };
-
     const msg_len = hdr.len - @sizeOf(InHeader);
+
+    var req = Request{
+        .hdr = hdr,
+        .body = .{ .other = opcode },
+    };
 
     switch (opcode) {
         .GETATTR => {
             const getattr_in =
                 mem.bytesAsValue(GetattrIn, msg[0..@sizeOf(GetattrIn)]);
 
-            std.debug.print("kernel: getattr: {}\n", .{getattr_in});
+            log.info("kernel: getattr: {}", .{getattr_in});
 
+            req.body = .{ .getattr = getattr_in };
+        },
+
+        .SETATTR => {
+            const setattr_in =
+                mem.bytesAsValue(SetattrIn, msg[0..@sizeOf(SetattrIn)]);
+
+            log.info("kernel: setattr: {}", .{setattr_in});
+
+            req.body = .{ .setattr = setattr_in };
+        },
+
+        .LOOKUP => {
+            const lookup_in: []const u8 = msg[0..msg_len];
+
+            log.info("kernel: lookup: {s}", .{lookup_in});
+
+            req.body = .{ .lookup = lookup_in };
+        },
+
+        .SETXATTR => {
+            const xattr_in = mem.bytesToValue(SetxattrIn, msg[0..@sizeOf(SetxattrIn)]);
+            const tail = msg[@sizeOf(SetxattrIn)..];
+
+            log.info("kernel: setxattr: {}", .{xattr_in});
+
+            const name_len = msg_len - @sizeOf(SetxattrIn) - xattr_in.size;
+            const name = tail[0 .. name_len - 1 :0];
+            const value = tail[name_len..];
+
+            req.body = .{ .setxattr = .{
+                .hdr = xattr_in,
+                .name = name,
+                .value = value,
+            } };
+        },
+
+        else => {
+            log.info("fuse: Not implemented: {}", .{opcode});
+        },
+    }
+
+    return req;
+}
+
+pub fn done_read_req(self: *S, req: Request) void {
+    const buf: []u8 = &self.read_buf;
+
+    self.read_len -= req.hdr.len;
+    mem.copyForwards(u8, buf, buf[req.hdr.len..]);
+}
+
+pub fn do_one(self: *S, comptime ops: Ops) !void {
+    const req = try self.start_read_req();
+
+    var res = Response.init(req);
+
+    switch (req.body) {
+        .getattr => {
             const time: u64 = @intCast(@min(0, std.time.timestamp()));
 
             res.out.attr = .{
-                .valid = time + 300,
+                .valid = 0,
                 .valid_nsec = 0,
                 .dummy = 0,
                 .attr = .{
-                    .ino = hdr.nodeid,
+                    .ino = req.hdr.nodeid,
                     .blocks = 1,
                     .size = 42,
                     .atime = time,
@@ -399,20 +494,15 @@ pub fn do_one(self: *S) !void {
             res.hdr.len += @sizeOf(AttrOut);
         },
 
-        .SETATTR => {
-            const setattr_in =
-                mem.bytesAsValue(SetattrIn, msg[0..@sizeOf(SetattrIn)]);
-
-            std.debug.print("kernel: setattr: {}\n", .{setattr_in});
-
+        .setattr => |setattr_in| {
             const time: u64 = @intCast(@min(0, std.time.timestamp()));
 
             res.out.attr = .{
-                .valid = time + 300,
+                .valid = 0,
                 .valid_nsec = 0,
                 .dummy = 0,
                 .attr = .{
-                    .ino = hdr.nodeid,
+                    .ino = req.hdr.nodeid,
                     .blocks = 1,
                     .size = 42,
                     .atime = time,
@@ -433,20 +523,17 @@ pub fn do_one(self: *S) !void {
 
             const v = setattr_in.valid;
             if (v & ~(FATTR.ATIME | FATTR.MTIME | FATTR.CTIME) > 0) {
-                std.debug.print("setattr: setting attributes not supported\n", .{});
+                log.info("setattr: setting attributes not supported", .{});
                 res.hdr.err = -@as(i32, @intFromEnum(E.OPNOTSUPP));
             } else {
                 res.hdr.len += @sizeOf(AttrOut);
             }
         },
 
-        .LOOKUP => blk: {
+        .lookup => |lookup_in| blk: {
             const Static = struct {
                 var generation: u64 = 0;
             };
-            const lookup_in: []const u8 = msg[0..msg_len];
-
-            std.debug.print("kernel: lookup: {s}\n", .{lookup_in});
 
             if (!mem.eql(u8, "foo", lookup_in[0..3])) {
                 res.hdr.err = -@as(i32, @intFromEnum(E.NOENT));
@@ -460,9 +547,9 @@ pub fn do_one(self: *S) !void {
             res.out.entry = .{
                 .nodeid = 0xf00,
                 .generation = Static.generation,
-                .entry_valid = time + 300,
+                .entry_valid = 0,
                 .entry_valid_nsec = 0,
-                .attr_valid = time + 300,
+                .attr_valid = 0,
                 .attr_valid_nsec = 0,
                 .attr = .{
                     .ino = 0xf00,
@@ -487,37 +574,14 @@ pub fn do_one(self: *S) !void {
             res.hdr.len += @sizeOf(EntryOut);
         },
 
-        .SETXATTR => {
-            const xattr_in = mem.bytesToValue(SetxattrIn, msg[0..@sizeOf(SetxattrIn)]);
-            const tail = msg[@sizeOf(SetxattrIn)..];
-
-            std.debug.print("kernel: setxattr: {}\n", .{xattr_in});
-
-            const name_len = msg_len - @sizeOf(SetxattrIn) - xattr_in.size;
-            const name = tail[0 .. name_len - 1 :0];
-            const value = tail[name_len..];
-
-            std.debug.print("kernel: setxattr: [{}]{s} => {s}\n", .{ name.len, name, value });
-
-            assert(mem.eql(u8, XATTR_NAME, name));
-            assert(mem.eql(u8, "baz", value));
-        },
-
-        else => {
-            res.hdr.err = -@as(i32, @intFromEnum(E.NOSYS));
-            std.debug.print("Not implemented: {}\n", .{opcode});
+        .setxattr => |xattr| {
+            if (ops.onSetxattr != null)
+                ops.onSetxattr.?(xattr.name, xattr.value);
         },
     }
 
-    var to_write: []u8 align(1) = mem.asBytes(&res)[0..res.hdr.len];
-
-    while (to_write.len > 0) {
-        const written = try os.write(fd, to_write);
-        to_write = to_write[written..];
-    }
-
-    self.read_len -= hdr.len;
-    mem.copyForwards(u8, buf, buf[hdr.len..]);
+    res.send(self.dev.handle);
+    self.done_read_req(req);
 }
 
 pub fn more(self: *S) !bool {
@@ -537,78 +601,96 @@ pub fn more(self: *S) !bool {
     return len == 1;
 }
 
+pub fn getTmpDir(env: std.process.EnvMap) !fs.Dir {
+    const tmp_dir_path = env.get("TMPDIR") orelse "/tmp";
+
+    return try fs.openDirAbsolute(tmp_dir_path, .{});
+}
+
+pub fn mkTmpDir(basename: []const u8, env: std.process.EnvMap) !fs.Dir {
+    var tmp_dir = try getTmpDir(env);
+    defer tmp_dir.close();
+    tmp_dir.makeDir(basename) catch |err| {
+        if (err != error.PathAlreadyExists)
+            return err;
+    };
+
+    return try tmp_dir.openDir(basename, .{});
+}
+
+pub fn realPosixPath(dir: fs.Dir, path: []const u8) ![fs.MAX_PATH_BYTES - 1:0]u8 {
+    var buf: [os.PATH_MAX]u8 = .{0} ** os.PATH_MAX;
+
+    return try os.toPosixPath(try dir.realpath(path, &buf));
+}
+
 const TestEnv = struct {
-    buf: []u8,
-    mnt_path: []const u8,
+    dir: fs.Dir,
 
     const allc = std.testing.allocator;
 
     pub fn init() !TestEnv {
         var env = try std.process.getEnvMap(allc);
         defer env.deinit();
-        const tmp_dir_path = env.get("TMPDIR") orelse "/tmp";
-
-        var tmp_dir = try fs.openDirAbsolute(tmp_dir_path, .{});
-        tmp_dir.makeDir("fuse-test") catch |err| {
-            if (err != error.PathAlreadyExists)
-                return err;
-        };
-
-        var buf = try allc.alloc(u8, os.PATH_MAX);
 
         return .{
-            .buf = buf,
-            .mnt_path = try tmp_dir.realpath("fuse-test", buf),
+            .dir = try mkTmpDir("fuse-test", env),
         };
     }
 
-    pub fn deinit(self: TestEnv) void {
-        allc.free(self.buf);
+    pub fn deinit(self: *TestEnv) void {
+        self.dir.close();
     }
 };
 
 test "init" {
-    const env = try TestEnv.init();
+    var env = try TestEnv.init();
     defer env.deinit();
 
-    var mnt = try init(env.mnt_path);
+    var mnt = try init(env.dir);
     defer mnt.deinit();
 
     assert(!try mnt.more());
 }
 
-fn setxattr(path: [*:0]const u8, name: [*:0]const u8, value: []const u8, size: usize, flags: usize) usize {
+pub fn setxattr(path: [*:0]const u8, name: [*:0]const u8, value: []const u8, size: usize, flags: usize) usize {
     return l.syscall5(.setxattr, @intFromPtr(path), @intFromPtr(name), @intFromPtr(value.ptr), size, flags);
 }
 
 fn setXAttr(env: *const TestEnv) void {
-    var buf: [os.PATH_MAX]u8 = .{0} ** os.PATH_MAX;
-
-    const path = std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}/{s}", .{ env.mnt_path, "foo" }) catch |err| {
-        std.debug.print("bufPrint: {}", .{err});
+    const path_c = realPosixPath(env.dir, "foo") catch |err| {
+        log.info("setxattr: realPosixPath: {}", .{err});
         return;
     };
 
-    const res = setxattr(@ptrCast(path), XATTR_NAME, "baz", 3, 0);
+    const res = setxattr(@ptrCast(&path_c), XATTR_NAME, "baz", 3, 0);
     const err = os.errno(res);
 
-    std.debug.print("setxattr: {s}: {}\n", .{ path, err });
+    log.info("setxattr: {}: {}", .{ env.dir, err });
+}
+
+fn setXAttrOp(name: [:0]const u8, value: []const u8) void {
+    log.info("kernel: setxattr: [{}]{s} => {s}", .{ name.len, name, value });
+
+    assert(mem.eql(u8, XATTR_NAME, name));
+    assert(mem.eql(u8, "baz", value));
 }
 
 test "one" {
-    const env = try TestEnv.init();
+    var env = try TestEnv.init();
     defer env.deinit();
 
-    var mnt = try init(env.mnt_path);
+    var mnt = try init(env.dir);
     defer mnt.deinit();
 
-    std.debug.print("init: {s}\n", .{env.mnt_path});
+    log.info("init: {}", .{env.dir});
     var thread = try std.Thread.spawn(.{}, setXAttr, .{&env});
 
-    try mnt.do_one();
-    try mnt.do_one();
-    try mnt.do_one();
-    try mnt.do_one();
+    const ops = Ops{ .onSetxattr = setXAttrOp };
+    try mnt.do_one(ops);
+    try mnt.do_one(ops);
+    try mnt.do_one(ops);
+    try mnt.do_one(ops);
 
     assert(!try mnt.more());
 
