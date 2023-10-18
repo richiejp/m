@@ -209,14 +209,22 @@ const SetxattrInReq = struct {
     value: []const u8,
 };
 
-const Request = struct { hdr: InHeader, body: union(enum) {
-    getattr: GetattrIn,
-    setattr: SetattrIn,
-    lookup: []const u8,
-    setxattr: SetxattrInReq,
+const ForgetIn = extern struct {
+    nlookup: u64,
+};
 
-    other: Opcode,
-} };
+const Request = struct {
+    hdr: *InHeader,
+    body: union(enum) {
+        getattr: *GetattrIn,
+        setattr: *SetattrIn,
+        lookup: []const u8,
+        forget: *ForgetIn,
+        setxattr: SetxattrInReq,
+
+        other: Opcode,
+    },
+};
 
 const OutUnion = extern union {
     init: InitOut,
@@ -224,7 +232,7 @@ const OutUnion = extern union {
     entry: EntryOut,
 };
 
-const Response = extern struct {
+pub const Response = extern struct {
     hdr: OutHeader,
     out: OutUnion,
 
@@ -239,8 +247,12 @@ const Response = extern struct {
         };
     }
 
+    pub fn err(self: *Response, e: E) void {
+        self.hdr.err = -@as(i32, @intFromEnum(e));
+    }
+
     pub fn send(self: Response, fd: os.fd_t) !void {
-        var to_write: []u8 align(1) = mem.asBytes(&self)[0..self.hdr.len];
+        var to_write: []const u8 align(1) = mem.asBytes(&self)[0..self.hdr.len];
 
         while (to_write.len > 0) {
             const written = try os.write(fd, to_write);
@@ -270,7 +282,7 @@ dev: fs.File,
 path: [fs.MAX_PATH_BYTES - 1:0]u8,
 
 read_len: usize = 0,
-read_buf: [MIN_READ_BUFFER * 2]u8 = undefined,
+read_buf: [MIN_READ_BUFFER * 2]u8 align(@alignOf(InHeader)) = undefined,
 
 fn umount(self: S) void {
     const ret = os.errno(l.umount(&self.path));
@@ -369,7 +381,7 @@ pub fn deinit(self: S) void {
 }
 
 pub fn start_read_req(self: *S) !Request {
-    const buf: []u8 = &self.read_buf;
+    const buf: []align(@alignOf(InHeader)) u8 = &self.read_buf;
     const fd = self.dev.handle;
 
     while (self.read_len < @sizeOf(InHeader)) {
@@ -426,6 +438,14 @@ pub fn start_read_req(self: *S) !Request {
             req.body = .{ .lookup = lookup_in };
         },
 
+        .FORGET => {
+            const forget_in = mem.bytesAsValue(ForgetIn, msg[0..@sizeOf(ForgetIn)]);
+
+            log.info("kernel: forget: {}:", .{forget_in});
+
+            req.body = .{ .forget = forget_in };
+        },
+
         .SETXATTR => {
             const xattr_in = mem.bytesToValue(SetxattrIn, msg[0..@sizeOf(SetxattrIn)]);
             const tail = msg[@sizeOf(SetxattrIn)..];
@@ -458,10 +478,8 @@ pub fn done_read_req(self: *S, req: Request) void {
     mem.copyForwards(u8, buf, buf[req.hdr.len..]);
 }
 
-pub fn do_one(self: *S, comptime ops: Ops) !void {
-    const req = try self.start_read_req();
-
-    var res = Response.init(req);
+pub fn do_default(self: *S, req: *const Request, res: *Response) !void {
+    _ = self;
 
     switch (req.body) {
         .getattr => {
@@ -545,11 +563,11 @@ pub fn do_one(self: *S, comptime ops: Ops) !void {
             Static.generation += 1;
 
             res.out.entry = .{
-                .nodeid = 0xf00,
+                .nodeid = 0xf00 + Static.generation - 1,
                 .generation = Static.generation,
-                .entry_valid = 0,
+                .entry_valid = 1000,
                 .entry_valid_nsec = 0,
-                .attr_valid = 0,
+                .attr_valid = 1000,
                 .attr_valid_nsec = 0,
                 .attr = .{
                     .ino = 0xf00,
@@ -574,13 +592,31 @@ pub fn do_one(self: *S, comptime ops: Ops) !void {
             res.hdr.len += @sizeOf(EntryOut);
         },
 
+        .forget => {},
+
+        .setxattr => unreachable,
+
+        .other => |opcode| {
+            log.err("fuse: Op not supported: {}", .{opcode});
+            res.hdr.err = -@as(i32, @intFromEnum(E.OPNOTSUPP));
+        },
+    }
+}
+
+pub fn do_one(self: *S, comptime ops: Ops) !void {
+    const req = try self.start_read_req();
+
+    var res = Response.init(req);
+
+    switch (req.body) {
         .setxattr => |xattr| {
             if (ops.onSetxattr != null)
                 ops.onSetxattr.?(xattr.name, xattr.value);
         },
+        else => try do_default(self, &req, &res),
     }
 
-    res.send(self.dev.handle);
+    try res.send(self.dev.handle);
     self.done_read_req(req);
 }
 
@@ -658,8 +694,8 @@ pub fn setxattr(path: [*:0]const u8, name: [*:0]const u8, value: []const u8, siz
 }
 
 fn setXAttr(env: *const TestEnv) void {
-    const path_c = realPosixPath(env.dir, "foo") catch |err| {
-        log.info("setxattr: realPosixPath: {}", .{err});
+    const path_c = os.toPosixPath("/tmp/fuse-test/foo") catch |err| {
+        log.err("setxattr: toPosixPath: {}", .{err});
         return;
     };
 
