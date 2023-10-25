@@ -268,6 +268,19 @@ const SyncPipe = struct {
 
         return false;
     }
+
+    pub fn read(self: Self, comptime T: type) !T {
+        var out: T = undefined;
+        const buf = mem.asBytes(&out);
+
+        _ = try os.read(self.pipe[0], &buf);
+
+        return out;
+    }
+
+    pub fn write(self: Self, obj: anytype) !void {
+        _ = try os.write(self.pipe[1], mem.asBytes(&obj));
+    }
 };
 
 fn sh() !void {
